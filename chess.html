@@ -1,14 +1,24 @@
 <!DOCTYPE html>
-        <script>
-            // Unconditional auto-reload every N milliseconds.
-            // Change AUTO_RELOAD_MS to adjust frequency (currently 1000 = 1s).
-            (function(){
-                const AUTO_RELOAD_MS = 1000;
-                setInterval(() => {
-                    try { location.reload(); } catch (e) { /* ignore */ }
-                }, AUTO_RELOAD_MS);
-            })();
-        </script>
+<html>
+
+<head>
+    <title>Chess Game</title>
+    <style>
+        .chess-board {
+            border: 2px solid #333;
+            width: 400px;
+            height: 400px;
+        }
+    </style>
+</head>
+
+<body>
+    <canvas class="chess-board" id="chessBoard" width="400" height="400"></canvas>
+    <div id="timerContainer" style="margin-top:8px; display:flex; gap:8px; align-items:center;">
+        <div id="whitePanel" style="flex:1; padding:8px; border-radius:6px; text-align:center; background:#fff;">
+            <div style="font-size:12px; color:#333;">White</div>
+            <div id="whiteTimer" style="font-size:20px; font-weight:700;">10:00</div>
+        </div>
         <div id="blackPanel" style="flex:1; padding:8px; border-radius:6px; text-align:center; background:#fff;">
             <div style="font-size:12px; color:#333;">Black</div>
             <div id="blackTimer" style="font-size:20px; font-weight:700;">10:00</div>
@@ -897,6 +907,4 @@
     </script>
 </body>
 
-
 </html>
-
