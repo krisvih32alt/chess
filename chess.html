@@ -1,0 +1,910 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Chess Game</title>
+    <style>
+        .chess-board {
+            border: 2px solid #333;
+            width: 400px;
+            height: 400px;
+        }
+    </style>
+</head>
+
+<body>
+    <canvas class="chess-board" id="chessBoard" width="400" height="400"></canvas>
+    <div id="timerContainer" style="margin-top:8px; display:flex; gap:8px; align-items:center;">
+        <div id="whitePanel" style="flex:1; padding:8px; border-radius:6px; text-align:center; background:#fff;">
+            <div style="font-size:12px; color:#333;">White</div>
+            <div id="whiteTimer" style="font-size:20px; font-weight:700;">10:00</div>
+        </div>
+        <div id="blackPanel" style="flex:1; padding:8px; border-radius:6px; text-align:center; background:#fff;">
+            <div style="font-size:12px; color:#333;">Black</div>
+            <div id="blackTimer" style="font-size:20px; font-weight:700;">10:00</div>
+        </div>
+        <div style="display:flex; gap:6px;">
+            <button id="timerStart">Start</button>
+            <button id="timerPause">Pause</button>
+            <button id="timerReset">Reset</button>
+        </div>
+    </div>
+    <script type="module">
+        // Firebase SDK + Realtime Database helper
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/9.23.0/firebase-app.js";
+        import { getDatabase, ref, push, onChildAdded, query as dbQuery, orderByChild, off, runTransaction, set, onValue } from "https://www.gstatic.com/firebasejs/9.23.0/firebase-database.js";
+
+        const firebaseConfig = {
+            apiKey: "AIzaSyCIP4PIUJUGkY_NJtkRyCI0XgkhVcHGvtQ",
+            authDomain: "chess-backend-krisvih32.firebaseapp.com",
+            projectId: "chess-backend-krisvih32",
+            storageBucket: "chess-backend-krisvih       32.firebasestorage.app",
+            messagingSenderId: "145054151147",
+            appId: "1:145054151147:web:d459a65c527d23cafc69ae"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const db = getDatabase(app);
+
+        export async function sendMove(roomId, move) {
+            // ensure timestamp
+            if (!move.ts) move.ts = Date.now();
+            await push(ref(db, `rooms/${roomId}/moves`), move);
+        }
+
+        export function listenMoves(roomId, onMove) {
+            const q = dbQuery(ref(db, `rooms/${roomId}/moves`), orderByChild('ts'));
+            const cb = (snap) => { const v = snap.val(); if (v) onMove(v); };
+            onChildAdded(q, cb);
+            return () => off(q, 'child_added', cb);
+        }
+
+        export async function setTimerState(roomId, state) {
+            await set(ref(db, `rooms/${roomId}/timer`), state);
+        }
+
+        export function listenTimerState(roomId, onState) {
+            const timerRef = ref(db, `rooms/${roomId}/timer`);
+            const cb = (snap) => { onState(snap.val()); };
+            onValue(timerRef, cb);
+            return () => off(timerRef, 'value', cb);
+        }
+
+        export function listenMeta(roomId, onMeta) {
+            const metaRef = ref(db, `rooms/${roomId}/meta`);
+            const cb = (snap) => { onMeta(snap.val()); };
+            onValue(metaRef, cb);
+            return () => off(metaRef, 'value', cb);
+        }
+
+        export async function setPresence(roomId, clientId, color) {
+            await set(ref(db, `rooms/${roomId}/presence/${clientId}`), { color, ts: Date.now() });
+        }
+
+        export function listenPresence(roomId, onPresence) {
+            const pRef = ref(db, `rooms/${roomId}/presence`);
+            const cb = (snap) => { onPresence(snap.val()); };
+            onValue(pRef, cb);
+            return () => off(pRef, 'value', cb);
+        }
+
+        // assignPlayer atomically places this client into the room's players map
+        export async function assignPlayer(roomId, clientId) {
+            const metaRef = ref(db, `rooms/${roomId}/meta`);
+            const res = await runTransaction(metaRef, (current) => {
+                if (!current) current = { players: {} };
+                if (!current.players) current.players = {};
+                if (current.players[clientId]) return; // already present
+                const colors = Object.values(current.players).map(p => p && p.color).filter(Boolean);
+                if (!colors.includes('white')) {
+                    current.players[clientId] = { color: 'white', ts: Date.now() };
+                } else if (!colors.includes('black')) {
+                    current.players[clientId] = { color: 'black', ts: Date.now() };
+                } else {
+                    current.players[clientId] = { color: 'spectator', ts: Date.now() };
+                }
+                return current;
+            });
+            let final = null;
+            try {
+                if (res && res.snapshot && typeof res.snapshot.val === 'function') {
+                    const snapVal = res.snapshot.val();
+                    if (snapVal && snapVal.players && snapVal.players[clientId]) final = snapVal.players[clientId];
+                }
+            } catch (e) { /* ignore */ }
+            return final && final.color ? final.color : 'spectator';
+        }
+        window.firebaseAssignPlayer = assignPlayer;
+
+        window.firebaseSendMove = sendMove;
+        window.firebaseListenMoves = listenMoves;
+        window.firebaseSetTimer = setTimerState;
+        window.firebaseListenTimer = listenTimerState;
+        window.firebaseListenMeta = listenMeta;
+        window.firebaseSetPresence = setPresence;
+        window.firebaseListenPresence = listenPresence;
+        window.firebaseDb = db;
+    </script>
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const BLACK = '#b58863';
+            const WHITE = '#f0d9b5';
+            const Color = { BLACK, WHITE };
+
+            let white = [];
+            let black = [];
+            let player = Color.WHITE;
+            let activePiece = null; // the piece the user has selected to move
+            let lastMoveOptions = []; // visual move hints for activePiece
+            let lastMove = null; // { piece, fromRow, fromCol, toRow, toCol }
+            let gameOver = false;
+            let gameResult = '';
+
+            const board = document.getElementById('chessBoard');
+            const ctx = board.getContext('2d');
+            const CELL = 50;
+            let ROOM_ID = location.hash.slice(1) || '';
+            let applyingRemoteMove = false;
+            const seenRemoteTimestamps = new Set();
+            const CLIENT_ID = localStorage.getItem('chess_client_id') || ('c_' + Math.random().toString(36).slice(2));
+            localStorage.setItem('chess_client_id', CLIENT_ID);
+            let myColor = Color.WHITE; // will be set when assigned
+            let lastPresenceObj = null;
+            const statusEl = document.createElement('div');
+            statusEl.style.marginTop = '8px';
+            document.body.appendChild(statusEl);
+            const linkEl = document.createElement('div');
+            linkEl.style.marginTop = '6px';
+            linkEl.style.wordBreak = 'break-all';
+            document.body.appendChild(linkEl);
+
+            // start/join overlay when no room hash provided
+            const overlay = document.createElement('div');
+            overlay.style.position = 'fixed'; overlay.style.left = 0; overlay.style.top = 0; overlay.style.right = 0; overlay.style.bottom = 0;
+            overlay.style.background = 'rgba(0,0,0,0.6)'; overlay.style.display = 'flex'; overlay.style.alignItems = 'center'; overlay.style.justifyContent = 'center';
+                        overlay.innerHTML = `<div style="background:white;padding:20px;border-radius:8px;width:320px;text-align:left;">
+                                <h3 style="margin:0 0 8px 0">Create Room</h3>
+                                <p style="font-size:12px;margin:6px 0">Click Create to generate a random room; share the URL with your opponent.</p>
+                                <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">
+                                    <button id="createRoomBtn">Create</button>
+                                </div>
+                                <div id="roomHint" style="margin-top:8px;font-size:12px;color:#555"></div>
+                        </div>`;
+            document.body.appendChild(overlay);
+
+            function showOverlay() { overlay.style.display = 'flex'; }
+            function hideOverlay() { overlay.style.display = 'none'; }
+
+            function makeRoomId() { return 'room-' + Math.random().toString(36).slice(2,9); }
+
+            async function joinRoom(roomId, ephemeral = false) {
+                ROOM_ID = roomId;
+                location.hash = ROOM_ID;
+                hideOverlay();
+                const useClientId = ephemeral ? ('c_' + Math.random().toString(36).slice(2)) : CLIENT_ID;
+                if (window.firebaseAssignPlayer) {
+                    try {
+                        const col = await window.firebaseAssignPlayer(ROOM_ID, useClientId);
+                        myColor = col === 'black' ? Color.BLACK : Color.WHITE;
+                        statusEl.textContent = 'You are: ' + (col || 'spectator');
+                        // listen for meta updates to notify host when player joins
+                        // listen to presence (more reliable for live join/leave)
+                        if (window.firebaseListenPresence) {
+                                    // only enable aggressive reload-watcher for ephemeral joiners (not the host)
+                                    const allowReload = !!ephemeral;
+                                    let reloadWatcher = null;
+                                    window.firebaseListenPresence(ROOM_ID, (p) => {
+                                lastPresenceObj = p;
+                                const players = p ? Object.values(p).map(x => x && x.color).filter(Boolean) : [];
+                                statusEl.textContent = 'You are: ' + (col || 'spectator') + ' — players: ' + players.join(', ');
+                                if (myColor === Color.WHITE) {
+                                    if (players.includes('black')) {
+                                        if (startBtn) startBtn.style.display = '';
+                                    } else {
+                                        if (startBtn) startBtn.style.display = 'none';
+                                    }
+                                }
+
+                                // start a short-lived reload watcher to auto-reload if presence doesn't stabilize
+                                if (allowReload && !reloadWatcher) {
+                                    let attempts = 0;
+                                    reloadWatcher = setInterval(() => {
+                                        attempts++;
+                                        const cur = lastPresenceObj ? Object.values(lastPresenceObj).map(x => x && x.color).filter(Boolean) : [];
+                                        const haveThis = cur.includes(col);
+                                        const haveOther = cur.includes(col === 'white' ? 'black' : 'white');
+                                        // if presence stabilized (we see ourselves and the other player when expected), stop reloading
+                                        if (haveThis && (myColor !== Color.WHITE || haveOther)) {
+                                            clearInterval(reloadWatcher); reloadWatcher = null; return;
+                                        }
+                                        // otherwise perform a reload attempt up to 5 times
+                                        if (attempts <= 5) {
+                                            try { console.warn('presence not stable, reloading to recover sync (attempt ' + attempts + ')'); } catch(e){}
+                                            location.reload();
+                                        } else {
+                                            clearInterval(reloadWatcher); reloadWatcher = null;
+                                        }
+                                    }, 1000);
+                                }
+                            });
+                        }
+                        // set our presence entry so others see us
+                        if (window.firebaseSetPresence) {
+                            window.firebaseSetPresence(ROOM_ID, useClientId, col).catch(e => console.warn('setPresence failed', e));
+                        }
+                    } catch (err) { console.warn('assignPlayer failed', err); statusEl.textContent='You are: unknown'; }
+                } else { statusEl.textContent = 'You are: local'; }
+            }
+
+            // wire overlay buttons (only Create — join via link)
+            const createRoomBtn = overlay.querySelector('#createRoomBtn');
+            const roomHint = overlay.querySelector('#roomHint');
+            createRoomBtn.addEventListener('click', async () => {
+                const id = makeRoomId();
+                roomHint.textContent = 'Share this room id or URL: #' + id;
+                await joinRoom(id, false);
+                // build URL that works on file:// and http(s)
+                const base = window.location.href.split('#')[0];
+                const url = base + '#' + id;
+                try {
+                    await navigator.clipboard.writeText(url);
+                    linkEl.innerHTML = 'Share URL: <a href="' + url + '">' + url + '</a> — copied to clipboard';
+                } catch (e) {
+                    linkEl.innerHTML = 'Share URL: <a href="' + url + '">' + url + '</a> <button id="copyUrlBtn">Copy</button>';
+                    const btn = document.getElementById('copyUrlBtn');
+                    if (btn) btn.addEventListener('click', () => {
+                        navigator.clipboard.writeText(url).then(() => { btn.textContent = 'Copied'; }).catch(() => { try { const ta = document.createElement('textarea'); ta.value = url; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); btn.textContent = 'Copied'; } catch (e) { btn.textContent = 'Copy failed'; } });
+                    });
+                }
+            });
+
+            // if hash present, auto-join
+            if (ROOM_ID) { hideOverlay(); joinRoom(ROOM_ID); } else { showOverlay(); }
+
+            const PIECE_PREPEND = 'classic/';
+            function createPieceImage(name) { const img = new Image(); img.src = PIECE_PREPEND + name; return img; }
+
+            const IMGS = {
+                wp: createPieceImage('wp.png'), bp: createPieceImage('bp.png'),
+                wr: createPieceImage('wr.png'), br: createPieceImage('br.png'),
+                wn: createPieceImage('wn.png'), bn: createPieceImage('bn.png'),
+                wb: createPieceImage('wb.png'), bb: createPieceImage('bb.png'),
+                wq: createPieceImage('wq.png'), bq: createPieceImage('bq.png'),
+                wk: createPieceImage('wk.png'), bk: createPieceImage('bk.png')
+            };
+
+            function drawImg(img, row, col) {
+                if (img.complete && img.naturalHeight !== 0) {
+                    const v = modelToView(row, col);
+                    ctx.drawImage(img, v.col * CELL, v.row * CELL, CELL, CELL);
+                }
+            }
+
+            function modelToView(row, col) {
+                if (myColor === Color.BLACK) return { row: 7 - row, col: 7 - col };
+                return { row, col };
+            }
+
+            // Timer state (defaults to 10 minutes each)
+            let whiteTimeMs = 10 * 60 * 1000;
+            let blackTimeMs = 10 * 60 * 1000;
+            let timerIntervalId = null;
+            let timerRunning = false;
+            let timerStarted = false;
+
+            const whiteTimerEl = document.getElementById('whiteTimer');
+            const blackTimerEl = document.getElementById('blackTimer');
+            const whitePanel = document.getElementById('whitePanel');
+            const blackPanel = document.getElementById('blackPanel');
+            const startBtn = document.getElementById('timerStart');
+            const pauseBtn = document.getElementById('timerPause');
+            const resetBtn = document.getElementById('timerReset');
+            // Only host may start; hide pause and reset from UI
+            if (pauseBtn) pauseBtn.style.display = 'none';
+            if (resetBtn) resetBtn.style.display = 'none';
+            if (startBtn) startBtn.style.display = 'none';
+                function applyTimerState(s) {
+                    if (!s) return;
+                    timerState = s;
+                    // compute remaining bases
+                    timerState.whiteBase = typeof s.whiteBase === 'number' ? s.whiteBase : whiteTimeMs;
+                    timerState.blackBase = typeof s.blackBase === 'number' ? s.blackBase : blackTimeMs;
+                    timerState.running = !!s.running;
+                    // prefer server-provided activeColor; default to white if missing
+                    timerState.activeColor = s.activeColor || 'white';
+                    // synchronize the local game turn with the timer's active color
+                    player = timerState.activeColor === 'white' ? Color.WHITE : Color.BLACK;
+                    timerState.lastUpdate = s.lastUpdate || Date.now();
+
+                    // compute current remaining
+                    const elapsed = timerState.running ? (Date.now() - timerState.lastUpdate) : 0;
+                    if (timerState.activeColor === 'white') {
+                        whiteTimeMs = timerState.whiteBase - elapsed;
+                        blackTimeMs = timerState.blackBase;
+                    } else {
+                        blackTimeMs = timerState.blackBase - elapsed;
+                        whiteTimeMs = timerState.whiteBase;
+                    }
+                    // ensure non-negative
+                    if (whiteTimeMs < 0) whiteTimeMs = 0;
+                    if (blackTimeMs < 0) blackTimeMs = 0;
+                    timerRunning = timerState.running;
+                    // start/stop local interval accordingly
+                    if (timerRunning && !timerIntervalId) {
+                        timerIntervalId = setInterval(() => {
+                            const el = Date.now() - timerState.lastUpdate;
+                            if (timerState.activeColor === 'white') {
+                                whiteTimeMs = timerState.whiteBase - el;
+                            } else {
+                                blackTimeMs = timerState.blackBase - el;
+                            }
+                            if (whiteTimeMs <= 0 || blackTimeMs <= 0) {
+                                pauseTimer();
+                                gameOver = true;
+                                gameResult = whiteTimeMs <= 0 ? 'Black wins on time' : 'White wins on time';
+                            }
+                            updateTimerDisplays();
+                        }, 100);
+                    } else if (!timerRunning && timerIntervalId) {
+                        clearInterval(timerIntervalId); timerIntervalId = null;
+                    }
+                }
+
+            function formatTime(ms) {
+                if (ms < 0) ms = 0;
+                const s = Math.floor(ms / 1000);
+                const mm = Math.floor(s / 60);
+                const ss = s % 60;
+                return `${mm}:${ss.toString().padStart(2,'0')}`;
+            }
+
+            function updateTimerDisplays() {
+                whiteTimerEl.textContent = formatTime(whiteTimeMs);
+                blackTimerEl.textContent = formatTime(blackTimeMs);
+                // highlight active player
+                if (player === Color.WHITE) {
+                    whitePanel.style.boxShadow = '0 0 0 3px rgba(0,200,0,0.15)';
+                    blackPanel.style.boxShadow = '';
+                } else {
+                    blackPanel.style.boxShadow = '0 0 0 3px rgba(0,200,0,0.15)';
+                    whitePanel.style.boxShadow = '';
+                }
+            }
+
+            function tickTimer() {
+                if (gameOver || !timerRunning) return;
+                const delta = 100; // ms
+                if (player === Color.WHITE) whiteTimeMs -= delta; else blackTimeMs -= delta;
+                if (whiteTimeMs <= 0 || blackTimeMs <= 0) {
+                    timerRunning = false; clearInterval(timerIntervalId); timerIntervalId = null;
+                    gameOver = true;
+                    gameResult = whiteTimeMs <= 0 ? 'Black wins on time' : 'White wins on time';
+                }
+                    try { updateTimerDisplays(); } catch (e) { /* ignore during init */ }
+            }
+
+            function startTimer() {
+                if (timerRunning) return; timerRunning = true; timerStarted = true;
+                timerIntervalId = setInterval(tickTimer, 100);
+                updateTimerDisplays();
+            }
+
+            function pauseTimer() {
+                timerRunning = false; if (timerIntervalId) { clearInterval(timerIntervalId); timerIntervalId = null; }
+            }
+
+            function resetTimer() {
+                pauseTimer(); whiteTimeMs = 10 * 60 * 1000; blackTimeMs = 10 * 60 * 1000; timerStarted = false; gameOver = false; gameResult = '';
+                updateTimerDisplays();
+            }
+
+            
+                startBtn.addEventListener('click', () => {
+                    startTimer();
+                    // publish timer state
+                    if (window.firebaseSetTimer) {
+                        const state = { whiteBase: whiteTimeMs, blackBase: blackTimeMs, running: true, activeColor: player === Color.WHITE ? 'white' : 'black', lastUpdate: Date.now() };
+                        window.firebaseSetTimer(ROOM_ID, state).catch(e => console.warn('setTimer failed', e));
+                    }
+                });
+                pauseBtn.addEventListener('click', () => {
+                    pauseTimer();
+                    if (window.firebaseSetTimer) {
+                        const state = { whiteBase: whiteTimeMs, blackBase: blackTimeMs, running: false, activeColor: player === Color.WHITE ? 'white' : 'black', lastUpdate: Date.now() };
+                        window.firebaseSetTimer(ROOM_ID, state).catch(e => console.warn('setTimer failed', e));
+                    }
+                });
+                resetBtn.addEventListener('click', () => {
+                    resetTimer();
+                    if (window.firebaseSetTimer) {
+                        const state = { whiteBase: whiteTimeMs, blackBase: blackTimeMs, running: false, activeColor: 'white', lastUpdate: Date.now() };
+                        window.firebaseSetTimer(ROOM_ID, state).catch(e => console.warn('setTimer failed', e));
+                    }
+                });
+
+            class Piece {
+                constructor(row, col, color) { this.row = row; this.col = col; this.color = color; }
+                draw() { }
+                moves() { return []; }
+            }
+
+                class Pawn extends Piece {
+                    constructor(row, col, color) { super(row, col, color); this.type = 'pawn'; }
+                    draw() { drawImg(this.color === Color.WHITE ? IMGS.wp : IMGS.bp, this.row, this.col); }
+                    moves(ownList, enemyList) {
+                        const moves = [];
+                        const direction = this.color === Color.WHITE ? -1 : 1;
+                        const startRow = this.color === Color.WHITE ? 6 : 1;
+
+                        const occupied = ownList.concat(enemyList);
+
+                        // one step forward (must be empty)
+                        const oneR = this.row + direction;
+                        if (oneR >= 0 && oneR < 8 && !occupied.some(p => p.row === oneR && p.col === this.col)) {
+                            moves.push({ row: oneR, col: this.col, capture: false });
+
+                            // two step from start (both squares must be empty)
+                            const twoR = this.row + 2 * direction;
+                            if (this.row === startRow && !occupied.some(p => p.row === twoR && p.col === this.col)) {
+                                moves.push({ row: twoR, col: this.col, capture: false });
+                            }
+                        }
+
+                        // diagonal captures (only if enemy present)
+                        const diagCols = [this.col - 1, this.col + 1];
+                        diagCols.forEach(dc => {
+                            const dr = this.row + direction;
+                            if (dr >= 0 && dr < 8 && dc >= 0 && dc < 8) {
+                                const enemyHere = enemyList.some(p => p.row === dr && p.col === dc);
+                                if (enemyHere) moves.push({ row: dr, col: dc, capture: true });
+                            }
+                        });
+
+                        // en-passant: if lastMove was an opposing pawn that moved two squares and is adjacent
+                        if (lastMove && lastMove.piece && lastMove.piece.type === 'pawn') {
+                            // lastMove.toRow is where the pawn ended up
+                            if (Math.abs(lastMove.toCol - this.col) === 1 && lastMove.toRow === this.row) {
+                                // pawn moved two squares? check from/to distance
+                                if (Math.abs(lastMove.fromRow - lastMove.toRow) === 2) {
+                                    const captureRow = lastMove.toRow + (lastMove.piece.color === Color.BLACK ? -1 : 1);
+                                    if (captureRow >= 0 && captureRow < 8) {
+                                        moves.push({ row: captureRow, col: lastMove.toCol, capture: true, enpassant: true });
+                                    }
+                                }
+                            }
+                        }
+
+                        return moves;
+                    }
+                }
+
+                class Rook extends Piece {
+                    constructor(r, c, color) { super(r, c, color); this.type = 'rook'; }
+                    draw() { drawImg(this.color === Color.WHITE ? IMGS.wr : IMGS.br, this.row, this.col); }
+                    moves(ownList, enemyList) {
+                        const moves = [];
+                        const dirs = [ [1,0], [-1,0], [0,1], [0,-1] ];
+                        const occupied = ownList.concat(enemyList);
+                        for (const [dr,dc] of dirs) {
+                            let r = this.row + dr, c = this.col + dc;
+                            while (r >= 0 && r < 8 && c >= 0 && c < 8) {
+                                const ownHere = ownList.some(p => p.row === r && p.col === c);
+                                if (ownHere) break;
+                                const enemyHere = enemyList.some(p => p.row === r && p.col === c);
+                                moves.push({ row: r, col: c, capture: !!enemyHere });
+                                if (enemyHere) break;
+                                r += dr; c += dc;
+                            }
+                        }
+                        return moves;
+                    }
+                }
+                class Knight extends Piece {
+                    constructor(r, c, color) { super(r, c, color); this.type = 'knight'; }
+                    draw() { drawImg(this.color === Color.WHITE ? IMGS.wn : IMGS.bn, this.row, this.col); }
+                    moves(ownList, enemyList) {
+                        const moves = [];
+                        const deltas = [[1,2],[1,-2],[-1,2],[-1,-2],[2,1],[2,-1],[-2,1],[-2,-1]];
+                        for (const [dr,dc] of deltas) {
+                            const r = this.row + dr, c = this.col + dc;
+                            if (r>=0 && r<8 && c>=0 && c<8) {
+                                const ownHere = ownList.some(p=>p.row===r && p.col===c);
+                                const enemyHere = enemyList.some(p=>p.row===r && p.col===c);
+                                if (!ownHere) moves.push({row:r,col:c,capture:!!enemyHere});
+                            }
+                        }
+                        return moves;
+                    }
+                }
+                class Bishop extends Piece {
+                    constructor(r, c, color) { super(r, c, color); this.type = 'bishop'; }
+                    draw() { drawImg(this.color === Color.WHITE ? IMGS.wb : IMGS.bb, this.row, this.col); }
+                    moves(ownList, enemyList) {
+                        const moves = [];
+                        const dirs = [[1,1],[1,-1],[-1,1],[-1,-1]];
+                        for (const [dr,dc] of dirs) {
+                            let r = this.row + dr, c = this.col + dc;
+                            while (r >= 0 && r < 8 && c >= 0 && c < 8) {
+                                const ownHere = ownList.some(p => p.row === r && p.col === c);
+                                if (ownHere) break;
+                                const enemyHere = enemyList.some(p => p.row === r && p.col === c);
+                                moves.push({ row: r, col: c, capture: !!enemyHere });
+                                if (enemyHere) break;
+                                r += dr; c += dc;
+                            }
+                        }
+                        return moves;
+                    }
+                }
+                class Queen extends Piece {
+                    constructor(r, c, color) { super(r, c, color); this.type = 'queen'; }
+                    draw() { drawImg(this.color === Color.WHITE ? IMGS.wq : IMGS.bq, this.row, this.col); }
+                    moves(ownList, enemyList) {
+                        // combine rook and bishop
+                        const rook = new Rook(this.row, this.col, this.color);
+                        const bishop = new Bishop(this.row, this.col, this.color);
+                        return [...rook.moves(ownList, enemyList), ...bishop.moves(ownList, enemyList)];
+                    }
+                }
+                class King extends Piece {
+                    constructor(r, c, color) { super(r, c, color); this.type = 'king'; }
+                    draw() { drawImg(this.color === Color.WHITE ? IMGS.wk : IMGS.bk, this.row, this.col); }
+                    moves(ownList, enemyList) {
+                        const moves = [];
+                        for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
+                            if (dr === 0 && dc === 0) continue;
+                            const r = this.row + dr, c = this.col + dc;
+                            if (r>=0 && r<8 && c>=0 && c<8) {
+                                const ownHere = ownList.some(p=>p.row===r && p.col===c);
+                                const enemyHere = enemyList.some(p=>p.row===r && p.col===c);
+                                if (!ownHere) moves.push({row:r,col:c,capture:!!enemyHere});
+                            }
+                        }
+                        return moves;
+                    }
+                }
+
+            function getListsForPlayer(p) {
+                return p === Color.WHITE ? { own: white, enemy: black } : { own: black, enemy: white };
+            }
+
+            // Helpers to determine attacks and king-safety
+            function isPathClear(fromR, fromC, toR, toC, allPieces) {
+                const dr = Math.sign(toR - fromR);
+                const dc = Math.sign(toC - fromC);
+                let r = fromR + dr, c = fromC + dc;
+                while (r !== toR || c !== toC) {
+                    if (allPieces.some(p => p.row === r && p.col === c)) return false;
+                    r += dr; c += dc;
+                }
+                return true;
+            }
+
+            function pieceAttacksSquare(piece, targetR, targetC, allOwn, allEnemy) {
+                const type = piece.type;
+                const pr = piece.row, pc = piece.col;
+                if (type === 'pawn') {
+                    const dir = piece.color === Color.WHITE ? -1 : 1;
+                    return (pr + dir === targetR) && (Math.abs(pc - targetC) === 1);
+                }
+                if (type === 'knight') {
+                    const dr = Math.abs(pr - targetR); const dc = Math.abs(pc - targetC);
+                    return (dr === 1 && dc === 2) || (dr === 2 && dc === 1);
+                }
+                if (type === 'king') {
+                    return Math.max(Math.abs(pr - targetR), Math.abs(pc - targetC)) === 1;
+                }
+                // sliding pieces
+                if (type === 'rook' || type === 'bishop' || type === 'queen') {
+                    const dr = targetR - pr; const dc = targetC - pc;
+                    const adr = Math.abs(dr), adc = Math.abs(dc);
+                    const all = allOwn.concat(allEnemy);
+                    if (type === 'rook' && (dr === 0 || dc === 0)) {
+                        if (!isPathClear(pr, pc, targetR, targetC, all)) return false;
+                        return true;
+                    }
+                    if (type === 'bishop' && adr === adc) {
+                        if (!isPathClear(pr, pc, targetR, targetC, all)) return false;
+                        return true;
+                    }
+                    if (type === 'queen' && (adr === adc || dr === 0 || dc === 0)) {
+                        if (!isPathClear(pr, pc, targetR, targetC, all)) return false;
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            function isSquareAttacked(r, c, byColor) {
+                const attackers = byColor === Color.WHITE ? white : black;
+                const own = byColor === Color.WHITE ? white : black;
+                const enemy = byColor === Color.WHITE ? black : white;
+                for (const p of attackers) {
+                    if (pieceAttacksSquare(p, r, c, own, enemy)) return true;
+                }
+                return false;
+            }
+
+            function moveLeavesKingInCheck(piece, move) {
+                // simulate move and test whether own king is in check
+                const ownList = piece.color === Color.WHITE ? white : black;
+                const enemyList = piece.color === Color.WHITE ? black : white;
+
+                const origR = piece.row, origC = piece.col;
+                // remove captured piece if any
+                let removed = null; let removedIndex = -1; let removedList = null;
+
+                if (move.enpassant && lastMove) {
+                    // en-passant captures the pawn that moved last
+                    removedList = enemyList;
+                    removedIndex = enemyList.findIndex(p => p.row === lastMove.toRow && p.col === lastMove.toCol);
+                    if (removedIndex !== -1) removed = enemyList.splice(removedIndex, 1)[0];
+                } else {
+                    removedList = enemyList;
+                    removedIndex = enemyList.findIndex(p => p.row === move.row && p.col === move.col);
+                    if (removedIndex !== -1) removed = enemyList.splice(removedIndex, 1)[0];
+                }
+
+                // apply move
+                piece.row = move.row; piece.col = move.col;
+
+                // find own king
+                const king = ownList.find(p => p.type === 'king');
+                const kingRow = king ? king.row : null;
+                const kingCol = king ? king.col : null;
+
+                const inCheck = kingRow !== null && isSquareAttacked(kingRow, kingCol, piece.color === Color.WHITE ? Color.BLACK : Color.WHITE);
+
+                // undo
+                piece.row = origR; piece.col = origC;
+                if (removed) removedList.splice(removedIndex, 0, removed);
+
+                return inCheck;
+            }
+
+            function initBoard() {
+                white = [];
+                black = [];
+                for (let i = 0; i < 8; i++) {
+                    white.push(new Pawn(6, i, Color.WHITE));
+                    black.push(new Pawn(1, i, Color.BLACK));
+                }
+                white.push(new Rook(7,0,Color.WHITE)); white.push(new Rook(7,7,Color.WHITE));
+                black.push(new Rook(0,0,Color.BLACK)); black.push(new Rook(0,7,Color.BLACK));
+                white.push(new Knight(7,1,Color.WHITE)); white.push(new Knight(7,6,Color.WHITE));
+                black.push(new Knight(0,1,Color.BLACK)); black.push(new Knight(0,6,Color.BLACK));
+                white.push(new Bishop(7,2,Color.WHITE)); white.push(new Bishop(7,5,Color.WHITE));
+                black.push(new Bishop(0,2,Color.BLACK)); black.push(new Bishop(0,5,Color.BLACK));
+                white.push(new Queen(7,3,Color.WHITE)); white.push(new King(7,4,Color.WHITE));
+                black.push(new Queen(0,3,Color.BLACK)); black.push(new King(0,4,Color.BLACK));
+            }
+
+            initBoard();
+
+            function clearCanvas() { ctx.fillStyle = WHITE; ctx.fillRect(0, 0, board.width, board.height); }
+
+            function drawBoard() {
+                // draw board squares using view-mapped positions so only layout flips; pieces/images remain upright
+                for (let r = 0; r < 8; r++) {
+                    for (let c = 0; c < 8; c++) {
+                        const v = modelToView(r, c);
+                        ctx.fillStyle = (r + c) % 2 === 0 ? WHITE : BLACK;
+                        ctx.fillRect(v.col * CELL, v.row * CELL, CELL, CELL);
+                    }
+                }
+
+                if (activePiece) {
+                    const v = modelToView(activePiece.row, activePiece.col);
+                    ctx.fillStyle = 'rgba(0,255,0,0.25)';
+                    ctx.fillRect(v.col * CELL, v.row * CELL, CELL, CELL);
+                    // draw non-capture dots under pieces
+                    lastMoveOptions.filter(m => !m.capture).forEach(m => {
+                        const mv = modelToView(m.row, m.col);
+                        ctx.beginPath(); ctx.fillStyle = 'rgba(0,0,0,0.6)';
+                        ctx.arc(mv.col * CELL + CELL / 2, mv.row * CELL + CELL / 2, 8, 0, Math.PI * 2); ctx.fill();
+                    });
+                }
+
+                white.forEach(p => p.draw());
+                black.forEach(p => p.draw());
+
+                // draw capture rings after pieces so they appear around the target piece
+                if (activePiece) {
+                    lastMoveOptions.filter(m => m.capture).forEach(m => {
+                        let ringRow = m.row, ringCol = m.col;
+                        if (m.enpassant && lastMove) {
+                            ringRow = lastMove.toRow;
+                            ringCol = lastMove.toCol;
+                        }
+                        const rv = modelToView(ringRow, ringCol);
+                        ctx.beginPath();
+                        ctx.lineWidth = 6;
+                        ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+                        ctx.arc(rv.col * CELL + CELL / 2, rv.row * CELL + CELL / 2, CELL * 0.45, 0, Math.PI * 2);
+                        ctx.stroke();
+                    });
+                    ctx.lineWidth = 1;
+                }
+
+                // game over overlay (unflipped)
+                if (gameOver) {
+                    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+                    ctx.fillRect(0,0,board.width,board.height);
+                    ctx.fillStyle = 'white';
+                    ctx.font = '24px sans-serif';
+                    ctx.textAlign = 'center';
+                    ctx.fillText(gameResult, board.width/2, board.height/2);
+                }
+            }
+
+            function flipPlayer() { 
+                player = player === Color.WHITE ? Color.BLACK : Color.WHITE;
+                activePiece = null;
+                lastMoveOptions = [];
+                checkGameOver();
+                // start timer on first flip if not started
+                if (!timerStarted) startTimer();
+                updateTimerDisplays();
+                // publish timer state on turn flip so all clients sync
+                if (window.firebaseSetTimer && ROOM_ID) {
+                    const state = { whiteBase: whiteTimeMs, blackBase: blackTimeMs, running: timerRunning, activeColor: player === Color.WHITE ? 'white' : 'black', lastUpdate: Date.now() };
+                    window.firebaseSetTimer(ROOM_ID, state).catch(e => console.warn('setTimer failed', e));
+                }
+        }
+
+            function hasLegalMovesForColor(color) {
+                const lists = getListsForPlayer(color);
+                const own = lists.own;
+                const enemy = lists.enemy;
+                for (const p of own) {
+                    const moves = p.moves(own, enemy) || [];
+                    for (const m of moves) {
+                        if (!moveLeavesKingInCheck(p, m)) return true;
+                    }
+                }
+                return false;
+            }
+
+            function checkGameOver() {
+                // if current player has no legal moves -> checkmate or stalemate
+                const hasMoves = hasLegalMovesForColor(player);
+                if (!hasMoves) {
+                    // is king in check?
+                    const lists = getListsForPlayer(player);
+                    const king = lists.own.find(p => p.type === 'king');
+                    const inCheck = king ? isSquareAttacked(king.row, king.col, player === Color.WHITE ? Color.BLACK : Color.WHITE) : false;
+                    if (inCheck) {
+                        gameResult = (player === Color.WHITE ? 'Black wins by checkmate' : 'White wins by checkmate');
+                    } else {
+                        gameResult = 'Draw by stalemate';
+                    }
+                    gameOver = true;
+                }
+            }
+
+            function findPieceAt(list, row, col) {
+                return list.find(p => p.row === row && p.col === col) || null;
+            }
+
+            board.addEventListener('click', (e) => {
+                const rect = board.getBoundingClientRect();
+                const x = e.clientX - rect.left; const y = e.clientY - rect.top;
+                let col = Math.floor(x / CELL); let row = Math.floor(y / CELL);
+
+                // if local view is flipped for Black, map view coords to model coords
+                const viewCol = col, viewRow = row;
+                if (myColor === Color.BLACK) {
+                    col = 7 - viewCol; row = 7 - viewRow;
+                }
+
+                // ignore input when it's not this client's turn
+                if (player !== myColor) return;
+
+                const { own, enemy } = getListsForPlayer(player);
+                const clickedOwn = findPieceAt(own, row, col);
+
+                if (!activePiece) {
+                    if (clickedOwn) { activePiece = clickedOwn; lastMoveOptions = activePiece.moves(own, enemy).filter(m => !moveLeavesKingInCheck(activePiece, m)); }
+                } else {
+                    const legal = lastMoveOptions;
+                    const matchedMove = legal.find(m => m.row === row && m.col === col);
+                    if (matchedMove) {
+                        const fromRow = activePiece.row, fromCol = activePiece.col;
+
+                        // compute captured square for sending (for en-passant the captured pawn was lastMove.toRow/Col)
+                        let capturedRow = row, capturedCol = col;
+                        if (matchedMove.enpassant && lastMove && lastMove.piece && lastMove.piece.type === 'pawn') {
+                            capturedRow = lastMove.toRow; capturedCol = lastMove.toCol;
+                        }
+
+                        // send move to RTDB (if available) -- avoid sending when applying remote move
+                        if (!applyingRemoteMove && window.firebaseSendMove) {
+                            const ts = Date.now();
+                            const moveDoc = {
+                                fromRow, fromCol,
+                                toRow: row, toCol: col,
+                                enpassant: !!matchedMove.enpassant,
+                                capturedRow, capturedCol,
+                                color: activePiece.color,
+                                type: activePiece.type,
+                                ts
+                            };
+                            // mark as seen locally so the listener won't reapply our own write
+                            seenRemoteTimestamps.add(ts);
+                            window.firebaseSendMove(ROOM_ID, moveDoc).catch(err => console.warn('sendMove failed', err));
+                        }
+
+                        // handle en-passant capture (remove captured pawn)
+                        if (matchedMove.enpassant && lastMove && lastMove.piece && lastMove.piece.type === 'pawn') {
+                            const idx = (enemy).findIndex(p => p.row === lastMove.toRow && p.col === lastMove.toCol);
+                            if (idx !== -1) enemy.splice(idx, 1);
+                        } else {
+                            // normal capture (if any)
+                            const captureIndex = enemy.findIndex(p => p.row === row && p.col === col);
+                            if (captureIndex !== -1) enemy.splice(captureIndex, 1);
+                        }
+
+                        // apply move
+                        activePiece.row = row; activePiece.col = col;
+
+                        // record lastMove (for en-passant detection next turn)
+                        lastMove = { piece: activePiece, fromRow, fromCol, toRow: row, toCol: col };
+
+                        // flip player and clear selection
+                        flipPlayer();
+                    } else {
+                        if (clickedOwn) { activePiece = clickedOwn; lastMoveOptions = activePiece.moves(own, enemy).filter(m => !moveLeavesKingInCheck(activePiece, m)); }
+                        else { activePiece = null; lastMoveOptions = []; }
+                    }
+                }
+            });
+
+            // listen for remote moves in this room
+            if (window.firebaseListenMoves) {
+                window.firebaseListenMoves(ROOM_ID, (doc) => {
+                    if (!doc || !doc.ts) return;
+                    if (seenRemoteTimestamps.has(doc.ts)) return; // already applied locally
+                    applyingRemoteMove = true;
+
+                    const fromRow = doc.fromRow, fromCol = doc.fromCol, toRow = doc.toRow, toCol = doc.toCol;
+                    const moverList = doc.color === Color.WHITE ? white : black;
+                    const enemyList = doc.color === Color.WHITE ? black : white;
+
+                    const piece = findPieceAt(moverList, fromRow, fromCol) || moverList.find(p => p.type === doc.type && p.row === fromRow && p.col === fromCol);
+                    if (piece) {
+                        // remove captured piece
+                        if (doc.enpassant && doc.capturedRow !== undefined) {
+                            const idx = enemyList.findIndex(p => p.row === doc.capturedRow && p.col === doc.capturedCol);
+                            if (idx !== -1) enemyList.splice(idx, 1);
+                        } else {
+                            const capIdx = enemyList.findIndex(p => p.row === toRow && p.col === toCol);
+                            if (capIdx !== -1) enemyList.splice(capIdx, 1);
+                        }
+
+                        piece.row = toRow; piece.col = toCol;
+                        lastMove = { piece: piece, fromRow: fromRow, fromCol: fromCol, toRow: toRow, toCol: toCol };
+                        seenRemoteTimestamps.add(doc.ts);
+                        // Don't call flipPlayer() on remote-applying side (avoids double-toggle/race with timer updates).
+                        // Instead, set the current player to the opposite of the mover's color so UI immediately matches.
+                        player = (doc.color === Color.WHITE) ? Color.BLACK : Color.WHITE;
+                        activePiece = null; lastMoveOptions = [];
+                        // keep displays in sync until timer state arrives
+                        try { updateTimerDisplays(); } catch (e) { }
+                    }
+
+                    applyingRemoteMove = false;
+                });
+            }
+
+            // listen for timer state changes
+            if (window.firebaseListenTimer) {
+                window.firebaseListenTimer(ROOM_ID, (s) => { try { applyTimerState(s); } catch (e) { console.warn('timer apply error', e); } });
+            }
+
+            function gameLoop() { clearCanvas(); drawBoard(); requestAnimationFrame(gameLoop); }
+            requestAnimationFrame(gameLoop);
+        });
+    </script>
+</body>
+
+</html>
