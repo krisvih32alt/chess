@@ -1,4 +1,27 @@
 <!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <title>Chess Game</title>
+</head>
+
+<body>
+    <canvas class="chess-board" id="chessBoard" width="400" height="400"></canvas>
+    <script>
+        // Diagnostic overlay removed — provide a no-op stub so existing calls are safe
+        (function(){
+            window.__diag = {
+                show: function() {},
+                log: function() {}
+            };
+        })();
+    </script>
+    <div id="timerContainer" style="margin-top:8px; display:flex; gap:8px; align-items:center;">
+        <div id="whitePanel" style="flex:1; padding:8px; border-radius:6px; text-align:center; background:#fff;">
+            <div style="font-size:12px; color:#333;">White</div>
+            <div id="whiteTimer" style="font-size:20px; font-weight:700;">10:00</div>
+        </div>
         <div id="blackPanel" style="flex:1; padding:8px; border-radius:6px; text-align:center; background:#fff;">
             <div style="font-size:12px; color:#333;">Black</div>
             <div id="blackTimer" style="font-size:20px; font-weight:700;">10:00</div>
@@ -25,6 +48,7 @@
 
         const app = initializeApp(firebaseConfig);
         const db = getDatabase(app);
+        try { window.__diag && window.__diag.log && window.__diag.log('firebase initialized'); } catch (e) {}
 
         export async function sendMove(roomId, move) {
             // ensure timestamp
@@ -104,9 +128,11 @@
         window.firebaseSetPresence = setPresence;
         window.firebaseListenPresence = listenPresence;
         window.firebaseDb = db;
+        try { window.__diag && window.__diag.log && window.__diag.log('firebase exports attached'); } catch (e) {}
     </script>
     <script>
         document.addEventListener('DOMContentLoaded', () => {
+            try { window.__diag && window.__diag.log && window.__diag.log('DOM ready, ROOM_ID=' + (location.hash.slice(1) || '')); } catch (e) {}
             const BLACK = '#b58863';
             const WHITE = '#f0d9b5';
             const Color = { BLACK, WHITE };
@@ -129,6 +155,45 @@
             const CLIENT_ID = localStorage.getItem('chess_client_id') || ('c_' + Math.random().toString(36).slice(2));
             localStorage.setItem('chess_client_id', CLIENT_ID);
             let myColor = Color.WHITE; // will be set when assigned
+            // last seen remote-move timestamp for diagnostics
+            let lastSeenMoveTs = 0;
+            // per-frame black-piece signature so we can detect changes each frame
+            let lastBlackSig = '';
+            function computeBlackSig() { return black.map(p => (p.type || '?') + '@' + p.row + ':' + p.col).sort().join('|'); }
+            function computeFullSig() { return ('W:' + white.map(p => (p.type||'?') + '@' + p.row + ':' + p.col).sort().join('|')) + '|' + ('B:' + black.map(p => (p.type||'?') + '@' + p.row + ':' + p.col).sort().join('|')); }
+            // track last white-move signature so White reloads until the board changes
+            let lastWhiteSig = null;
+            let lastWhiteMoveTs = 0;
+            try {
+                const s = sessionStorage.getItem('lastWhiteSig'); if (s) lastWhiteSig = s;
+                const t = parseInt(sessionStorage.getItem('lastWhiteMoveTs')||'0', 10); if (!isNaN(t) && t>0) lastWhiteMoveTs = t;
+            } catch (e) {}
+            let reloadUntilWhiteId = null;
+            function startReloadUntilWhite() {
+                if (myColor !== Color.WHITE) return;
+                if (!lastWhiteSig) return;
+                if (reloadUntilWhiteId) return;
+                try { window.__diag && window.__diag.log && window.__diag.log('start reload-until-white sig=' + (lastWhiteSig||'<none>')); } catch (e) {}
+                try { sessionStorage.setItem('lastWhiteSig', lastWhiteSig); sessionStorage.setItem('lastWhiteMoveTs', String(lastWhiteMoveTs)); } catch (e) {}
+                reloadUntilWhiteId = setInterval(() => {
+                    try {
+                        const cur = computeFullSig();
+                        if (cur !== lastWhiteSig) {
+                            try { window.__diag && window.__diag.log && window.__diag.log('board changed; stopping reload (cur!=' + cur + ')'); } catch (e) {}
+                            stopReloadUntilWhite();
+                            return;
+                        }
+                        const base = location.href.split('#')[0].split('?')[0];
+                        location.href = base + '?r=' + Date.now() + location.hash;
+                    } catch (e) { /* ignore */ }
+                }, 1);
+            }
+            function stopReloadUntilWhite() {
+                if (!reloadUntilWhiteId) return;
+                clearInterval(reloadUntilWhiteId); reloadUntilWhiteId = null;
+                try { sessionStorage.removeItem('lastWhiteSig'); sessionStorage.removeItem('lastWhiteMoveTs'); } catch (e) {}
+                try { window.__diag && window.__diag.log && window.__diag.log('stop reload-until-white'); } catch (e) {}
+            }
             let lastPresenceObj = null;
             const statusEl = document.createElement('div');
             statusEl.style.marginTop = '8px';
@@ -142,7 +207,7 @@
             const overlay = document.createElement('div');
             overlay.style.position = 'fixed'; overlay.style.left = 0; overlay.style.top = 0; overlay.style.right = 0; overlay.style.bottom = 0;
             overlay.style.background = 'rgba(0,0,0,0.6)'; overlay.style.display = 'flex'; overlay.style.alignItems = 'center'; overlay.style.justifyContent = 'center';
-                        overlay.innerHTML = `<div style="background:white;padding:20px;border-radius:8px;width:320px;text-align:left;">
+            overlay.innerHTML = `<div style="background:white;padding:20px;border-radius:8px;width:320px;text-align:left;">
                                 <h3 style="margin:0 0 8px 0">Create Room</h3>
                                 <p style="font-size:12px;margin:6px 0">Click Create to generate a random room; share the URL with your opponent.</p>
                                 <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">
@@ -155,12 +220,79 @@
             function showOverlay() { overlay.style.display = 'flex'; }
             function hideOverlay() { overlay.style.display = 'none'; }
 
-            function makeRoomId() { return 'room-' + Math.random().toString(36).slice(2,9); }
+            function makeRoomId() { return 'room-' + Math.random().toString(36).slice(2, 9); }
+
+            // room-scoped listener unsubscribes
+            let _unsubMoves = null;
+            let _unsubTimer = null;
+
+            function setupRoomListeners() {
+                // detach previous if any
+                try { if (_unsubMoves) { _unsubMoves(); _unsubMoves = null; } } catch(e){}
+                try { if (_unsubTimer) { _unsubTimer(); _unsubTimer = null; } } catch(e){}
+
+                if (!ROOM_ID) return;
+
+                // attach moves listener for this room
+                if (window.firebaseListenMoves) {
+                    _unsubMoves = window.firebaseListenMoves(ROOM_ID, (doc) => {
+                        try { window.__diag && window.__diag.log && window.__diag.log('remote move received: ' + (typeof doc === 'object' ? JSON.stringify(doc).slice(0,200) : String(doc))); } catch (e) {}
+                        if (!doc || !doc.ts) return;
+                        // ignore moves we sent ourselves
+                        if (seenRemoteTimestamps.has(doc.ts)) return;
+
+                        // no special-case reload here; apply moves normally and then manage reload state
+
+                        // Otherwise apply the move locally so white moves show immediately
+                        applyingRemoteMove = true;
+                        const fromRow = doc.fromRow, fromCol = doc.fromCol, toRow = doc.toRow, toCol = doc.toCol;
+                        const moverList = doc.color === Color.WHITE ? white : black;
+                        const enemyList = doc.color === Color.WHITE ? black : white;
+                        const piece = findPieceAt(moverList, fromRow, fromCol) || moverList.find(p => p.type === doc.type && p.row === fromRow && p.col === fromCol);
+                        if (piece) {
+                            if (doc.enpassant && doc.capturedRow !== undefined) {
+                                const idx = enemyList.findIndex(p => p.row === doc.capturedRow && p.col === doc.capturedCol);
+                                if (idx !== -1) enemyList.splice(idx, 1);
+                            } else {
+                                const capIdx = enemyList.findIndex(p => p.row === toRow && p.col === toCol);
+                                if (capIdx !== -1) enemyList.splice(capIdx, 1);
+                            }
+                            piece.row = toRow; piece.col = toCol;
+                            lastMove = { piece: piece, fromRow: fromRow, fromCol: fromCol, toRow: toRow, toCol: toCol };
+                            seenRemoteTimestamps.add(doc.ts);
+                            try { lastSeenMoveTs = doc.ts; } catch (e) {}
+                            // if this was a white move, record the board signature and start reload (only for white client)
+                            try {
+                                if (doc.color === Color.WHITE) {
+                                    lastWhiteSig = computeFullSig();
+                                    lastWhiteMoveTs = doc.ts || Date.now();
+                                    try { sessionStorage.setItem('lastWhiteSig', lastWhiteSig); sessionStorage.setItem('lastWhiteMoveTs', String(lastWhiteMoveTs)); } catch (e) {}
+                                    if (myColor === Color.WHITE) startReloadUntilWhite();
+                                } else if (doc.color === Color.BLACK) {
+                                    // if a black move has a later timestamp than the white move, stop reloading
+                                    if (lastWhiteMoveTs && doc.ts && doc.ts > lastWhiteMoveTs) stopReloadUntilWhite();
+                                }
+                            } catch (e) {}
+                            player = (doc.color === Color.WHITE) ? Color.BLACK : Color.WHITE;
+                            activePiece = null; lastMoveOptions = [];
+                            try { updateTimerDisplays(); } catch (e) {}
+                        }
+                        applyingRemoteMove = false;
+                    });
+                }
+
+                // attach timer listener for this room
+                if (window.firebaseListenTimer) {
+                    _unsubTimer = window.firebaseListenTimer(ROOM_ID, (s) => { try { applyTimerState(s); } catch (e) { console.warn('timer apply error', e); } });
+                }
+            }
 
             async function joinRoom(roomId, ephemeral = false) {
                 ROOM_ID = roomId;
                 location.hash = ROOM_ID;
                 hideOverlay();
+                try { setupRoomListeners(); } catch (e) { console.warn('setupRoomListeners failed', e); }
+                try { window.__diag && window.__diag.log && window.__diag.log('joinRoom called for ' + ROOM_ID + ' ephemeral=' + !!ephemeral); } catch (e) {}
                 const useClientId = ephemeral ? ('c_' + Math.random().toString(36).slice(2)) : CLIENT_ID;
                 if (window.firebaseAssignPlayer) {
                     try {
@@ -170,10 +302,10 @@
                         // listen for meta updates to notify host when player joins
                         // listen to presence (more reliable for live join/leave)
                         if (window.firebaseListenPresence) {
-                                    // only enable aggressive reload-watcher for ephemeral joiners (not the host)
-                                    const allowReload = !!ephemeral;
-                                    let reloadWatcher = null;
-                                    window.firebaseListenPresence(ROOM_ID, (p) => {
+                            // only enable aggressive reload-watcher for ephemeral joiners (not the host)
+                            const allowReload = !!ephemeral;
+                            let reloadWatcher = null;
+                            window.firebaseListenPresence(ROOM_ID, (p) => {
                                 lastPresenceObj = p;
                                 const players = p ? Object.values(p).map(x => x && x.color).filter(Boolean) : [];
                                 statusEl.textContent = 'You are: ' + (col || 'spectator') + ' — players: ' + players.join(', ');
@@ -199,7 +331,7 @@
                                         }
                                         // otherwise perform a reload attempt up to 5 times
                                         if (attempts <= 5) {
-                                            try { console.warn('presence not stable, reloading to recover sync (attempt ' + attempts + ')'); } catch(e){}
+                                            try { console.warn('presence not stable, reloading to recover sync (attempt ' + attempts + ')'); } catch (e) { }
                                             location.reload();
                                         } else {
                                             clearInterval(reloadWatcher); reloadWatcher = null;
@@ -212,7 +344,7 @@
                         if (window.firebaseSetPresence) {
                             window.firebaseSetPresence(ROOM_ID, useClientId, col).catch(e => console.warn('setPresence failed', e));
                         }
-                    } catch (err) { console.warn('assignPlayer failed', err); statusEl.textContent='You are: unknown'; }
+                    } catch (err) { console.warn('assignPlayer failed', err); statusEl.textContent = 'You are: unknown'; }
                 } else { statusEl.textContent = 'You are: local'; }
             }
 
@@ -254,640 +386,690 @@
             };
 
             function drawImg(img, row, col) {
-                if (img.complete && img.naturalHeight !== 0) {
-                    const v = modelToView(row, col);
+                const v = modelToView(row, col);
+                if (img && img.complete && img.naturalHeight !== 0) {
                     ctx.drawImage(img, v.col * CELL, v.row * CELL, CELL, CELL);
+                    return;
                 }
+                // Fallback: draw a simple circle if image not loaded or missing
+                try {
+const src = img && img.src ? img.src : '';
+                    const isWhite = /(?:[\/\\]|^)w(?:p|r|n|b|q|k)\.png$/i.test(src);
+        ctx.fillStyle = isWhite ? '#ffffff' : '#000000';
+        ctx.beginPath();
+        ctx.arc(v.col * CELL + CELL / 2, v.row * CELL + CELL / 2, CELL * 0.28, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+                } catch (e) { /* ignore fallback errors */ }
             }
 
-            function modelToView(row, col) {
-                if (myColor === Color.BLACK) return { row: 7 - row, col: 7 - col };
-                return { row, col };
-            }
-
-            // Timer state (defaults to 10 minutes each)
-            let whiteTimeMs = 10 * 60 * 1000;
-            let blackTimeMs = 10 * 60 * 1000;
-            let timerIntervalId = null;
-            let timerRunning = false;
-            let timerStarted = false;
-            // highest-seen timer state timestamp to avoid applying stale updates
-            let lastTimerUpdate = 0;
-
-            const whiteTimerEl = document.getElementById('whiteTimer');
-            const blackTimerEl = document.getElementById('blackTimer');
-            const whitePanel = document.getElementById('whitePanel');
-            const blackPanel = document.getElementById('blackPanel');
-            const startBtn = document.getElementById('timerStart');
-            const pauseBtn = document.getElementById('timerPause');
-            const resetBtn = document.getElementById('timerReset');
-            // Only host may start; hide pause and reset from UI
-            if (pauseBtn) pauseBtn.style.display = 'none';
-            if (resetBtn) resetBtn.style.display = 'none';
-            if (startBtn) startBtn.style.display = 'none';
-                function applyTimerState(s) {
-                    if (!s) return;
-                    // ignore stale updates (use lastUpdate if provided by the sender)
-                    if (s.lastUpdate && s.lastUpdate <= lastTimerUpdate) return;
-                    timerState = s;
-                    lastTimerUpdate = s.lastUpdate || Date.now();
-                    // compute remaining bases
-                    timerState.whiteBase = typeof s.whiteBase === 'number' ? s.whiteBase : whiteTimeMs;
-                    timerState.blackBase = typeof s.blackBase === 'number' ? s.blackBase : blackTimeMs;
-                    timerState.running = !!s.running;
-                    // prefer server-provided activeColor; default to white if missing
-                    timerState.activeColor = s.activeColor || 'white';
-                    // synchronize the local game turn with the timer's active color
-                    player = timerState.activeColor === 'white' ? Color.WHITE : Color.BLACK;
-                    timerState.lastUpdate = s.lastUpdate || Date.now();
-
-                    // compute current remaining
-                    const elapsed = timerState.running ? (Date.now() - timerState.lastUpdate) : 0;
-                    if (timerState.activeColor === 'white') {
-                        whiteTimeMs = timerState.whiteBase - elapsed;
-                        blackTimeMs = timerState.blackBase;
-                    } else {
-                        blackTimeMs = timerState.blackBase - elapsed;
-                        whiteTimeMs = timerState.whiteBase;
-                    }
-                    // ensure non-negative
-                    if (whiteTimeMs < 0) whiteTimeMs = 0;
-                    if (blackTimeMs < 0) blackTimeMs = 0;
-                    timerRunning = timerState.running;
-                    // start/stop local interval accordingly
-                    if (timerRunning && !timerIntervalId) {
-                        timerIntervalId = setInterval(() => {
-                            const el = Date.now() - timerState.lastUpdate;
-                            if (timerState.activeColor === 'white') {
-                                whiteTimeMs = timerState.whiteBase - el;
-                            } else {
-                                blackTimeMs = timerState.blackBase - el;
-                            }
-                            if (whiteTimeMs <= 0 || blackTimeMs <= 0) {
-                                pauseTimer();
-                                gameOver = true;
-                                gameResult = whiteTimeMs <= 0 ? 'Black wins on time' : 'White wins on time';
-                            }
-                            updateTimerDisplays();
-                        }, 100);
-                    } else if (!timerRunning && timerIntervalId) {
-                        clearInterval(timerIntervalId); timerIntervalId = null;
-                    }
-                }
-
-            function formatTime(ms) {
-                if (ms < 0) ms = 0;
-                const s = Math.floor(ms / 1000);
-                const mm = Math.floor(s / 60);
-                const ss = s % 60;
-                return `${mm}:${ss.toString().padStart(2,'0')}`;
-            }
-
-            function updateTimerDisplays() {
-                whiteTimerEl.textContent = formatTime(whiteTimeMs);
-                blackTimerEl.textContent = formatTime(blackTimeMs);
-                // highlight active player
-                if (player === Color.WHITE) {
-                    whitePanel.style.boxShadow = '0 0 0 3px rgba(0,200,0,0.15)';
-                    blackPanel.style.boxShadow = '';
-                } else {
-                    blackPanel.style.boxShadow = '0 0 0 3px rgba(0,200,0,0.15)';
-                    whitePanel.style.boxShadow = '';
-                }
-            }
-
-            function tickTimer() {
-                if (gameOver || !timerRunning) return;
-                const delta = 100; // ms
-                if (player === Color.WHITE) whiteTimeMs -= delta; else blackTimeMs -= delta;
-                if (whiteTimeMs <= 0 || blackTimeMs <= 0) {
-                    timerRunning = false; clearInterval(timerIntervalId); timerIntervalId = null;
-                    gameOver = true;
-                    gameResult = whiteTimeMs <= 0 ? 'Black wins on time' : 'White wins on time';
-                }
-                    try { updateTimerDisplays(); } catch (e) { /* ignore during init */ }
-            }
-
-            function startTimer() {
-                if (timerRunning) return; timerRunning = true; timerStarted = true;
-                timerIntervalId = setInterval(tickTimer, 100);
-                updateTimerDisplays();
-            }
-
-            function pauseTimer() {
-                timerRunning = false; if (timerIntervalId) { clearInterval(timerIntervalId); timerIntervalId = null; }
-            }
-
-            function resetTimer() {
-                pauseTimer(); whiteTimeMs = 10 * 60 * 1000; blackTimeMs = 10 * 60 * 1000; timerStarted = false; gameOver = false; gameResult = '';
-                updateTimerDisplays();
-            }
-
-            
-                startBtn.addEventListener('click', () => {
-                    startTimer();
-                    // publish timer state
-                    if (window.firebaseSetTimer) {
-                        const state = { whiteBase: whiteTimeMs, blackBase: blackTimeMs, running: true, activeColor: player === Color.WHITE ? 'white' : 'black', lastUpdate: Date.now() };
-                        window.firebaseSetTimer(ROOM_ID, state).catch(e => console.warn('setTimer failed', e));
-                    }
-                });
-                pauseBtn.addEventListener('click', () => {
-                    pauseTimer();
-                    if (window.firebaseSetTimer) {
-                        const state = { whiteBase: whiteTimeMs, blackBase: blackTimeMs, running: false, activeColor: player === Color.WHITE ? 'white' : 'black', lastUpdate: Date.now() };
-                        window.firebaseSetTimer(ROOM_ID, state).catch(e => console.warn('setTimer failed', e));
-                    }
-                });
-                resetBtn.addEventListener('click', () => {
-                    resetTimer();
-                    if (window.firebaseSetTimer) {
-                        const state = { whiteBase: whiteTimeMs, blackBase: blackTimeMs, running: false, activeColor: 'white', lastUpdate: Date.now() };
-                        window.firebaseSetTimer(ROOM_ID, state).catch(e => console.warn('setTimer failed', e));
-                    }
-                });
-
-            class Piece {
-                constructor(row, col, color) { this.row = row; this.col = col; this.color = color; }
-                draw() { }
-                moves() { return []; }
-            }
-
-                class Pawn extends Piece {
-                    constructor(row, col, color) { super(row, col, color); this.type = 'pawn'; }
-                    draw() { drawImg(this.color === Color.WHITE ? IMGS.wp : IMGS.bp, this.row, this.col); }
-                    moves(ownList, enemyList) {
-                        const moves = [];
-                        const direction = this.color === Color.WHITE ? -1 : 1;
-                        const startRow = this.color === Color.WHITE ? 6 : 1;
-
-                        const occupied = ownList.concat(enemyList);
-
-                        // one step forward (must be empty)
-                        const oneR = this.row + direction;
-                        if (oneR >= 0 && oneR < 8 && !occupied.some(p => p.row === oneR && p.col === this.col)) {
-                            moves.push({ row: oneR, col: this.col, capture: false });
-
-                            // two step from start (both squares must be empty)
-                            const twoR = this.row + 2 * direction;
-                            if (this.row === startRow && !occupied.some(p => p.row === twoR && p.col === this.col)) {
-                                moves.push({ row: twoR, col: this.col, capture: false });
-                            }
-                        }
-
-                        // diagonal captures (only if enemy present)
-                        const diagCols = [this.col - 1, this.col + 1];
-                        diagCols.forEach(dc => {
-                            const dr = this.row + direction;
-                            if (dr >= 0 && dr < 8 && dc >= 0 && dc < 8) {
-                                const enemyHere = enemyList.some(p => p.row === dr && p.col === dc);
-                                if (enemyHere) moves.push({ row: dr, col: dc, capture: true });
-                            }
-                        });
-
-                        // en-passant: if lastMove was an opposing pawn that moved two squares and is adjacent
-                        if (lastMove && lastMove.piece && lastMove.piece.type === 'pawn') {
-                            // lastMove.toRow is where the pawn ended up
-                            if (Math.abs(lastMove.toCol - this.col) === 1 && lastMove.toRow === this.row) {
-                                // pawn moved two squares? check from/to distance
-                                if (Math.abs(lastMove.fromRow - lastMove.toRow) === 2) {
-                                    const captureRow = lastMove.toRow + (lastMove.piece.color === Color.BLACK ? -1 : 1);
-                                    if (captureRow >= 0 && captureRow < 8) {
-                                        moves.push({ row: captureRow, col: lastMove.toCol, capture: true, enpassant: true });
-                                    }
-                                }
-                            }
-                        }
-
-                        return moves;
-                    }
-                }
-
-                class Rook extends Piece {
-                    constructor(r, c, color) { super(r, c, color); this.type = 'rook'; }
-                    draw() { drawImg(this.color === Color.WHITE ? IMGS.wr : IMGS.br, this.row, this.col); }
-                    moves(ownList, enemyList) {
-                        const moves = [];
-                        const dirs = [ [1,0], [-1,0], [0,1], [0,-1] ];
-                        const occupied = ownList.concat(enemyList);
-                        for (const [dr,dc] of dirs) {
-                            let r = this.row + dr, c = this.col + dc;
-                            while (r >= 0 && r < 8 && c >= 0 && c < 8) {
-                                const ownHere = ownList.some(p => p.row === r && p.col === c);
-                                if (ownHere) break;
-                                const enemyHere = enemyList.some(p => p.row === r && p.col === c);
-                                moves.push({ row: r, col: c, capture: !!enemyHere });
-                                if (enemyHere) break;
-                                r += dr; c += dc;
-                            }
-                        }
-                        return moves;
-                    }
-                }
-                class Knight extends Piece {
-                    constructor(r, c, color) { super(r, c, color); this.type = 'knight'; }
-                    draw() { drawImg(this.color === Color.WHITE ? IMGS.wn : IMGS.bn, this.row, this.col); }
-                    moves(ownList, enemyList) {
-                        const moves = [];
-                        const deltas = [[1,2],[1,-2],[-1,2],[-1,-2],[2,1],[2,-1],[-2,1],[-2,-1]];
-                        for (const [dr,dc] of deltas) {
-                            const r = this.row + dr, c = this.col + dc;
-                            if (r>=0 && r<8 && c>=0 && c<8) {
-                                const ownHere = ownList.some(p=>p.row===r && p.col===c);
-                                const enemyHere = enemyList.some(p=>p.row===r && p.col===c);
-                                if (!ownHere) moves.push({row:r,col:c,capture:!!enemyHere});
-                            }
-                        }
-                        return moves;
-                    }
-                }
-                class Bishop extends Piece {
-                    constructor(r, c, color) { super(r, c, color); this.type = 'bishop'; }
-                    draw() { drawImg(this.color === Color.WHITE ? IMGS.wb : IMGS.bb, this.row, this.col); }
-                    moves(ownList, enemyList) {
-                        const moves = [];
-                        const dirs = [[1,1],[1,-1],[-1,1],[-1,-1]];
-                        for (const [dr,dc] of dirs) {
-                            let r = this.row + dr, c = this.col + dc;
-                            while (r >= 0 && r < 8 && c >= 0 && c < 8) {
-                                const ownHere = ownList.some(p => p.row === r && p.col === c);
-                                if (ownHere) break;
-                                const enemyHere = enemyList.some(p => p.row === r && p.col === c);
-                                moves.push({ row: r, col: c, capture: !!enemyHere });
-                                if (enemyHere) break;
-                                r += dr; c += dc;
-                            }
-                        }
-                        return moves;
-                    }
-                }
-                class Queen extends Piece {
-                    constructor(r, c, color) { super(r, c, color); this.type = 'queen'; }
-                    draw() { drawImg(this.color === Color.WHITE ? IMGS.wq : IMGS.bq, this.row, this.col); }
-                    moves(ownList, enemyList) {
-                        // combine rook and bishop
-                        const rook = new Rook(this.row, this.col, this.color);
-                        const bishop = new Bishop(this.row, this.col, this.color);
-                        return [...rook.moves(ownList, enemyList), ...bishop.moves(ownList, enemyList)];
-                    }
-                }
-                class King extends Piece {
-                    constructor(r, c, color) { super(r, c, color); this.type = 'king'; }
-                    draw() { drawImg(this.color === Color.WHITE ? IMGS.wk : IMGS.bk, this.row, this.col); }
-                    moves(ownList, enemyList) {
-                        const moves = [];
-                        for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
-                            if (dr === 0 && dc === 0) continue;
-                            const r = this.row + dr, c = this.col + dc;
-                            if (r>=0 && r<8 && c>=0 && c<8) {
-                                const ownHere = ownList.some(p=>p.row===r && p.col===c);
-                                const enemyHere = enemyList.some(p=>p.row===r && p.col===c);
-                                if (!ownHere) moves.push({row:r,col:c,capture:!!enemyHere});
-                            }
-                        }
-                        return moves;
-                    }
-                }
-
-            function getListsForPlayer(p) {
-                return p === Color.WHITE ? { own: white, enemy: black } : { own: black, enemy: white };
-            }
-
-            // Helpers to determine attacks and king-safety
-            function isPathClear(fromR, fromC, toR, toC, allPieces) {
-                const dr = Math.sign(toR - fromR);
-                const dc = Math.sign(toC - fromC);
-                let r = fromR + dr, c = fromC + dc;
-                while (r !== toR || c !== toC) {
-                    if (allPieces.some(p => p.row === r && p.col === c)) return false;
-                    r += dr; c += dc;
-                }
-                return true;
-            }
-
-            function pieceAttacksSquare(piece, targetR, targetC, allOwn, allEnemy) {
-                const type = piece.type;
-                const pr = piece.row, pc = piece.col;
-                if (type === 'pawn') {
-                    const dir = piece.color === Color.WHITE ? -1 : 1;
-                    return (pr + dir === targetR) && (Math.abs(pc - targetC) === 1);
-                }
-                if (type === 'knight') {
-                    const dr = Math.abs(pr - targetR); const dc = Math.abs(pc - targetC);
-                    return (dr === 1 && dc === 2) || (dr === 2 && dc === 1);
-                }
-                if (type === 'king') {
-                    return Math.max(Math.abs(pr - targetR), Math.abs(pc - targetC)) === 1;
-                }
-                // sliding pieces
-                if (type === 'rook' || type === 'bishop' || type === 'queen') {
-                    const dr = targetR - pr; const dc = targetC - pc;
-                    const adr = Math.abs(dr), adc = Math.abs(dc);
-                    const all = allOwn.concat(allEnemy);
-                    if (type === 'rook' && (dr === 0 || dc === 0)) {
-                        if (!isPathClear(pr, pc, targetR, targetC, all)) return false;
-                        return true;
-                    }
-                    if (type === 'bishop' && adr === adc) {
-                        if (!isPathClear(pr, pc, targetR, targetC, all)) return false;
-                        return true;
-                    }
-                    if (type === 'queen' && (adr === adc || dr === 0 || dc === 0)) {
-                        if (!isPathClear(pr, pc, targetR, targetC, all)) return false;
-                        return true;
-                    }
-                }
-                return false;
-            }
-
-            function isSquareAttacked(r, c, byColor) {
-                const attackers = byColor === Color.WHITE ? white : black;
-                const own = byColor === Color.WHITE ? white : black;
-                const enemy = byColor === Color.WHITE ? black : white;
-                for (const p of attackers) {
-                    if (pieceAttacksSquare(p, r, c, own, enemy)) return true;
-                }
-                return false;
-            }
-
-            function moveLeavesKingInCheck(piece, move) {
-                // simulate move and test whether own king is in check
-                const ownList = piece.color === Color.WHITE ? white : black;
-                const enemyList = piece.color === Color.WHITE ? black : white;
-
-                const origR = piece.row, origC = piece.col;
-                // remove captured piece if any
-                let removed = null; let removedIndex = -1; let removedList = null;
-
-                if (move.enpassant && lastMove) {
-                    // en-passant captures the pawn that moved last
-                    removedList = enemyList;
-                    removedIndex = enemyList.findIndex(p => p.row === lastMove.toRow && p.col === lastMove.toCol);
-                    if (removedIndex !== -1) removed = enemyList.splice(removedIndex, 1)[0];
-                } else {
-                    removedList = enemyList;
-                    removedIndex = enemyList.findIndex(p => p.row === move.row && p.col === move.col);
-                    if (removedIndex !== -1) removed = enemyList.splice(removedIndex, 1)[0];
-                }
-
-                // apply move
-                piece.row = move.row; piece.col = move.col;
-
-                // find own king
-                const king = ownList.find(p => p.type === 'king');
-                const kingRow = king ? king.row : null;
-                const kingCol = king ? king.col : null;
-
-                const inCheck = kingRow !== null && isSquareAttacked(kingRow, kingCol, piece.color === Color.WHITE ? Color.BLACK : Color.WHITE);
-
-                // undo
-                piece.row = origR; piece.col = origC;
-                if (removed) removedList.splice(removedIndex, 0, removed);
-
-                return inCheck;
-            }
-
-            function initBoard() {
-                white = [];
-                black = [];
-                for (let i = 0; i < 8; i++) {
-                    white.push(new Pawn(6, i, Color.WHITE));
-                    black.push(new Pawn(1, i, Color.BLACK));
-                }
-                white.push(new Rook(7,0,Color.WHITE)); white.push(new Rook(7,7,Color.WHITE));
-                black.push(new Rook(0,0,Color.BLACK)); black.push(new Rook(0,7,Color.BLACK));
-                white.push(new Knight(7,1,Color.WHITE)); white.push(new Knight(7,6,Color.WHITE));
-                black.push(new Knight(0,1,Color.BLACK)); black.push(new Knight(0,6,Color.BLACK));
-                white.push(new Bishop(7,2,Color.WHITE)); white.push(new Bishop(7,5,Color.WHITE));
-                black.push(new Bishop(0,2,Color.BLACK)); black.push(new Bishop(0,5,Color.BLACK));
-                white.push(new Queen(7,3,Color.WHITE)); white.push(new King(7,4,Color.WHITE));
-                black.push(new Queen(0,3,Color.BLACK)); black.push(new King(0,4,Color.BLACK));
-            }
-
-            initBoard();
-
-            function clearCanvas() { ctx.fillStyle = WHITE; ctx.fillRect(0, 0, board.width, board.height); }
-
-            function drawBoard() {
-                // draw board squares using view-mapped positions so only layout flips; pieces/images remain upright
-                for (let r = 0; r < 8; r++) {
-                    for (let c = 0; c < 8; c++) {
-                        const v = modelToView(r, c);
-                        ctx.fillStyle = (r + c) % 2 === 0 ? WHITE : BLACK;
-                        ctx.fillRect(v.col * CELL, v.row * CELL, CELL, CELL);
-                    }
-                }
-
-                if (activePiece) {
-                    const v = modelToView(activePiece.row, activePiece.col);
-                    ctx.fillStyle = 'rgba(0,255,0,0.25)';
-                    ctx.fillRect(v.col * CELL, v.row * CELL, CELL, CELL);
-                    // draw non-capture dots under pieces
-                    lastMoveOptions.filter(m => !m.capture).forEach(m => {
-                        const mv = modelToView(m.row, m.col);
-                        ctx.beginPath(); ctx.fillStyle = 'rgba(0,0,0,0.6)';
-                        ctx.arc(mv.col * CELL + CELL / 2, mv.row * CELL + CELL / 2, 8, 0, Math.PI * 2); ctx.fill();
-                    });
-                }
-
-                white.forEach(p => p.draw());
-                black.forEach(p => p.draw());
-
-                // draw capture rings after pieces so they appear around the target piece
-                if (activePiece) {
-                    lastMoveOptions.filter(m => m.capture).forEach(m => {
-                        let ringRow = m.row, ringCol = m.col;
-                        if (m.enpassant && lastMove) {
-                            ringRow = lastMove.toRow;
-                            ringCol = lastMove.toCol;
-                        }
-                        const rv = modelToView(ringRow, ringCol);
-                        ctx.beginPath();
-                        ctx.lineWidth = 6;
-                        ctx.strokeStyle = 'rgba(0,0,0,0.6)';
-                        ctx.arc(rv.col * CELL + CELL / 2, rv.row * CELL + CELL / 2, CELL * 0.45, 0, Math.PI * 2);
-                        ctx.stroke();
-                    });
-                    ctx.lineWidth = 1;
-                }
-
-                // game over overlay (unflipped)
-                if (gameOver) {
-                    ctx.fillStyle = 'rgba(0,0,0,0.6)';
-                    ctx.fillRect(0,0,board.width,board.height);
-                    ctx.fillStyle = 'white';
-                    ctx.font = '24px sans-serif';
-                    ctx.textAlign = 'center';
-                    ctx.fillText(gameResult, board.width/2, board.height/2);
-                }
-            }
-
-            function flipPlayer() { 
-                player = player === Color.WHITE ? Color.BLACK : Color.WHITE;
-                activePiece = null;
-                lastMoveOptions = [];
-                checkGameOver();
-                // start timer on first flip if not started
-                if (!timerStarted) startTimer();
-                updateTimerDisplays();
-                // publish timer state on turn flip so all clients sync
-                if (window.firebaseSetTimer && ROOM_ID) {
-                    const state = { whiteBase: whiteTimeMs, blackBase: blackTimeMs, running: timerRunning, activeColor: player === Color.WHITE ? 'white' : 'black', lastUpdate: Date.now() };
-                    window.firebaseSetTimer(ROOM_ID, state).catch(e => console.warn('setTimer failed', e));
-                }
+        function modelToView(row, col) {
+            if (myColor === Color.BLACK) return { row: 7 - row, col: 7 - col };
+            return { row, col };
         }
 
-            function hasLegalMovesForColor(color) {
-                const lists = getListsForPlayer(color);
-                const own = lists.own;
-                const enemy = lists.enemy;
-                for (const p of own) {
-                    const moves = p.moves(own, enemy) || [];
-                    for (const m of moves) {
-                        if (!moveLeavesKingInCheck(p, m)) return true;
-                    }
-                }
-                return false;
-            }
+        // Timer state (defaults to 10 minutes each)
+        let whiteTimeMs = 10 * 60 * 1000;
+        let blackTimeMs = 10 * 60 * 1000;
+        let timerIntervalId = null;
+        let timerRunning = false;
+        let timerStarted = false;
+        // highest-seen timer state timestamp to avoid applying stale updates
+        let lastTimerUpdate = 0;
 
-            function checkGameOver() {
-                // if current player has no legal moves -> checkmate or stalemate
-                const hasMoves = hasLegalMovesForColor(player);
-                if (!hasMoves) {
-                    // is king in check?
-                    const lists = getListsForPlayer(player);
-                    const king = lists.own.find(p => p.type === 'king');
-                    const inCheck = king ? isSquareAttacked(king.row, king.col, player === Color.WHITE ? Color.BLACK : Color.WHITE) : false;
-                    if (inCheck) {
-                        gameResult = (player === Color.WHITE ? 'Black wins by checkmate' : 'White wins by checkmate');
+        const whiteTimerEl = document.getElementById('whiteTimer');
+        const blackTimerEl = document.getElementById('blackTimer');
+        const whitePanel = document.getElementById('whitePanel');
+        const blackPanel = document.getElementById('blackPanel');
+        const startBtn = document.getElementById('timerStart');
+        const pauseBtn = document.getElementById('timerPause');
+        const resetBtn = document.getElementById('timerReset');
+        // Only host may start; hide pause and reset from UI
+        if (pauseBtn) pauseBtn.style.display = 'none';
+        if (resetBtn) resetBtn.style.display = 'none';
+        if (startBtn) startBtn.style.display = 'none';
+        function applyTimerState(s) {
+            if (!s) return;
+                try { console.debug && console.debug('applyTimerState', s, 'lastTimerUpdate=', lastTimerUpdate); } catch (e) {}
+                // ignore stale updates (use lastUpdate if provided by the sender)
+                if (s.lastUpdate && s.lastUpdate <= lastTimerUpdate) return;
+                timerState = s;
+                lastTimerUpdate = s.lastUpdate || Date.now();
+                // set room-level 'started' flag so joiners know the game already began
+                timerStarted = timerStarted || !!s.started || !!s.running;
+            // compute remaining bases
+            timerState.whiteBase = typeof s.whiteBase === 'number' ? s.whiteBase : whiteTimeMs;
+            timerState.blackBase = typeof s.blackBase === 'number' ? s.blackBase : blackTimeMs;
+            timerState.running = !!s.running;
+            // prefer server-provided activeColor; default to white if missing
+            timerState.activeColor = s.activeColor || 'white';
+            // synchronize the local game turn with the timer's active color
+            player = timerState.activeColor === 'white' ? Color.WHITE : Color.BLACK;
+            timerState.lastUpdate = s.lastUpdate || Date.now();
+
+            // compute current remaining
+            const elapsed = timerState.running ? (Date.now() - timerState.lastUpdate) : 0;
+            if (timerState.activeColor === 'white') {
+                whiteTimeMs = timerState.whiteBase - elapsed;
+                blackTimeMs = timerState.blackBase;
+            } else {
+                blackTimeMs = timerState.blackBase - elapsed;
+                whiteTimeMs = timerState.whiteBase;
+            }
+            // ensure non-negative
+            if (whiteTimeMs < 0) whiteTimeMs = 0;
+            if (blackTimeMs < 0) blackTimeMs = 0;
+            timerRunning = timerState.running;
+            // reload-until-white is now triggered on white moves only
+            // start/stop local interval accordingly
+            if (timerRunning && !timerIntervalId) {
+                timerIntervalId = setInterval(() => {
+                    const el = Date.now() - timerState.lastUpdate;
+                    if (timerState.activeColor === 'white') {
+                        whiteTimeMs = timerState.whiteBase - el;
                     } else {
-                        gameResult = 'Draw by stalemate';
+                        blackTimeMs = timerState.blackBase - el;
                     }
-                    gameOver = true;
+                    if (whiteTimeMs <= 0 || blackTimeMs <= 0) {
+                        pauseTimer();
+                        gameOver = true;
+                        gameResult = whiteTimeMs <= 0 ? 'Black wins on time' : 'White wins on time';
+                    }
+                    updateTimerDisplays();
+                }, 100);
+            } else if (!timerRunning && timerIntervalId) {
+                clearInterval(timerIntervalId); timerIntervalId = null;
+            }
+        }
+
+        function formatTime(ms) {
+            if (ms < 0) ms = 0;
+            const s = Math.floor(ms / 1000);
+            const mm = Math.floor(s / 60);
+            const ss = s % 60;
+            return `${mm}:${ss.toString().padStart(2, '0')}`;
+        }
+
+        function updateTimerDisplays() {
+            whiteTimerEl.textContent = formatTime(whiteTimeMs);
+            blackTimerEl.textContent = formatTime(blackTimeMs);
+            // highlight active player
+            if (player === Color.WHITE) {
+                whitePanel.style.boxShadow = '0 0 0 3px rgba(0,200,0,0.15)';
+                blackPanel.style.boxShadow = '';
+            } else {
+                blackPanel.style.boxShadow = '0 0 0 3px rgba(0,200,0,0.15)';
+                whitePanel.style.boxShadow = '';
+            }
+        }
+
+        function tickTimer() {
+            if (gameOver || !timerRunning) return;
+            const delta = 100; // ms
+            if (player === Color.WHITE) whiteTimeMs -= delta; else blackTimeMs -= delta;
+            if (whiteTimeMs <= 0 || blackTimeMs <= 0) {
+                timerRunning = false; clearInterval(timerIntervalId); timerIntervalId = null;
+                gameOver = true;
+                gameResult = whiteTimeMs <= 0 ? 'Black wins on time' : 'White wins on time';
+            }
+            try { updateTimerDisplays(); } catch (e) { /* ignore during init */ }
+        }
+
+        function startTimer() {
+            if (timerRunning) return; timerRunning = true; timerStarted = true;
+            timerIntervalId = setInterval(tickTimer, 100);
+            updateTimerDisplays();
+        }
+
+        function pauseTimer() {
+            timerRunning = false; if (timerIntervalId) { clearInterval(timerIntervalId); timerIntervalId = null; }
+        }
+
+        function resetTimer() {
+            pauseTimer(); whiteTimeMs = 10 * 60 * 1000; blackTimeMs = 10 * 60 * 1000; timerStarted = false; gameOver = false; gameResult = '';
+            updateTimerDisplays();
+        }
+
+
+        startBtn.addEventListener('click', () => {
+            startTimer();
+            // publish timer state
+            if (window.firebaseSetTimer) {
+                        const state = { whiteBase: whiteTimeMs, blackBase: blackTimeMs, running: true, started: true, activeColor: player === Color.WHITE ? 'white' : 'black', lastUpdate: Date.now() };
+                window.firebaseSetTimer(ROOM_ID, state).catch(e => console.warn('setTimer failed', e));
+            }
+        });
+        pauseBtn.addEventListener('click', () => {
+            pauseTimer();
+            if (window.firebaseSetTimer) {
+                        const state = { whiteBase: whiteTimeMs, blackBase: blackTimeMs, running: false, started: true, activeColor: player === Color.WHITE ? 'white' : 'black', lastUpdate: Date.now() };
+                window.firebaseSetTimer(ROOM_ID, state).catch(e => console.warn('setTimer failed', e));
+            }
+        });
+        resetBtn.addEventListener('click', () => {
+            resetTimer();
+            if (window.firebaseSetTimer) {
+                        const state = { whiteBase: whiteTimeMs, blackBase: blackTimeMs, running: false, started: false, activeColor: 'white', lastUpdate: Date.now() };
+                window.firebaseSetTimer(ROOM_ID, state).catch(e => console.warn('setTimer failed', e));
+            }
+        });
+
+        class Piece {
+            constructor(row, col, color) { this.row = row; this.col = col; this.color = color; }
+            draw() { }
+            moves() { return []; }
+        }
+
+        class Pawn extends Piece {
+            constructor(row, col, color) { super(row, col, color); this.type = 'pawn'; }
+            draw() { drawImg(this.color === Color.WHITE ? IMGS.wp : IMGS.bp, this.row, this.col); }
+            moves(ownList, enemyList) {
+                const moves = [];
+                const direction = this.color === Color.WHITE ? -1 : 1;
+                const startRow = this.color === Color.WHITE ? 6 : 1;
+
+                const occupied = ownList.concat(enemyList);
+
+                // one step forward (must be empty)
+                const oneR = this.row + direction;
+                if (oneR >= 0 && oneR < 8 && !occupied.some(p => p.row === oneR && p.col === this.col)) {
+                    moves.push({ row: oneR, col: this.col, capture: false });
+
+                    // two step from start (both squares must be empty)
+                    const twoR = this.row + 2 * direction;
+                    if (this.row === startRow && !occupied.some(p => p.row === twoR && p.col === this.col)) {
+                        moves.push({ row: twoR, col: this.col, capture: false });
+                    }
+                }
+
+                // diagonal captures (only if enemy present)
+                const diagCols = [this.col - 1, this.col + 1];
+                diagCols.forEach(dc => {
+                    const dr = this.row + direction;
+                    if (dr >= 0 && dr < 8 && dc >= 0 && dc < 8) {
+                        const enemyHere = enemyList.some(p => p.row === dr && p.col === dc);
+                        if (enemyHere) moves.push({ row: dr, col: dc, capture: true });
+                    }
+                });
+
+                // en-passant: if lastMove was an opposing pawn that moved two squares and is adjacent
+                if (lastMove && lastMove.piece && lastMove.piece.type === 'pawn') {
+                    // lastMove.toRow is where the pawn ended up
+                    if (Math.abs(lastMove.toCol - this.col) === 1 && lastMove.toRow === this.row) {
+                        // pawn moved two squares? check from/to distance
+                        if (Math.abs(lastMove.fromRow - lastMove.toRow) === 2) {
+                            const captureRow = lastMove.toRow + (lastMove.piece.color === Color.BLACK ? -1 : 1);
+                            if (captureRow >= 0 && captureRow < 8) {
+                                moves.push({ row: captureRow, col: lastMove.toCol, capture: true, enpassant: true });
+                            }
+                        }
+                    }
+                }
+
+                return moves;
+            }
+        }
+
+        class Rook extends Piece {
+            constructor(r, c, color) { super(r, c, color); this.type = 'rook'; }
+            draw() { drawImg(this.color === Color.WHITE ? IMGS.wr : IMGS.br, this.row, this.col); }
+            moves(ownList, enemyList) {
+                const moves = [];
+                const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+                const occupied = ownList.concat(enemyList);
+                for (const [dr, dc] of dirs) {
+                    let r = this.row + dr, c = this.col + dc;
+                    while (r >= 0 && r < 8 && c >= 0 && c < 8) {
+                        const ownHere = ownList.some(p => p.row === r && p.col === c);
+                        if (ownHere) break;
+                        const enemyHere = enemyList.some(p => p.row === r && p.col === c);
+                        moves.push({ row: r, col: c, capture: !!enemyHere });
+                        if (enemyHere) break;
+                        r += dr; c += dc;
+                    }
+                }
+                return moves;
+            }
+        }
+        class Knight extends Piece {
+            constructor(r, c, color) { super(r, c, color); this.type = 'knight'; }
+            draw() { drawImg(this.color === Color.WHITE ? IMGS.wn : IMGS.bn, this.row, this.col); }
+            moves(ownList, enemyList) {
+                const moves = [];
+                const deltas = [[1, 2], [1, -2], [-1, 2], [-1, -2], [2, 1], [2, -1], [-2, 1], [-2, -1]];
+                for (const [dr, dc] of deltas) {
+                    const r = this.row + dr, c = this.col + dc;
+                    if (r >= 0 && r < 8 && c >= 0 && c < 8) {
+                        const ownHere = ownList.some(p => p.row === r && p.col === c);
+                        const enemyHere = enemyList.some(p => p.row === r && p.col === c);
+                        if (!ownHere) moves.push({ row: r, col: c, capture: !!enemyHere });
+                    }
+                }
+                return moves;
+            }
+        }
+        class Bishop extends Piece {
+            constructor(r, c, color) { super(r, c, color); this.type = 'bishop'; }
+            draw() { drawImg(this.color === Color.WHITE ? IMGS.wb : IMGS.bb, this.row, this.col); }
+            moves(ownList, enemyList) {
+                const moves = [];
+                const dirs = [[1, 1], [1, -1], [-1, 1], [-1, -1]];
+                for (const [dr, dc] of dirs) {
+                    let r = this.row + dr, c = this.col + dc;
+                    while (r >= 0 && r < 8 && c >= 0 && c < 8) {
+                        const ownHere = ownList.some(p => p.row === r && p.col === c);
+                        if (ownHere) break;
+                        const enemyHere = enemyList.some(p => p.row === r && p.col === c);
+                        moves.push({ row: r, col: c, capture: !!enemyHere });
+                        if (enemyHere) break;
+                        r += dr; c += dc;
+                    }
+                }
+                return moves;
+            }
+        }
+        class Queen extends Piece {
+            constructor(r, c, color) { super(r, c, color); this.type = 'queen'; }
+            draw() { drawImg(this.color === Color.WHITE ? IMGS.wq : IMGS.bq, this.row, this.col); }
+            moves(ownList, enemyList) {
+                // combine rook and bishop
+                const rook = new Rook(this.row, this.col, this.color);
+                const bishop = new Bishop(this.row, this.col, this.color);
+                return [...rook.moves(ownList, enemyList), ...bishop.moves(ownList, enemyList)];
+            }
+        }
+        class King extends Piece {
+            constructor(r, c, color) { super(r, c, color); this.type = 'king'; }
+            draw() { drawImg(this.color === Color.WHITE ? IMGS.wk : IMGS.bk, this.row, this.col); }
+            moves(ownList, enemyList) {
+                const moves = [];
+                for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
+                    if (dr === 0 && dc === 0) continue;
+                    const r = this.row + dr, c = this.col + dc;
+                    if (r >= 0 && r < 8 && c >= 0 && c < 8) {
+                        const ownHere = ownList.some(p => p.row === r && p.col === c);
+                        const enemyHere = enemyList.some(p => p.row === r && p.col === c);
+                        if (!ownHere) moves.push({ row: r, col: c, capture: !!enemyHere });
+                    }
+                }
+                return moves;
+            }
+        }
+
+        function getListsForPlayer(p) {
+            return p === Color.WHITE ? { own: white, enemy: black } : { own: black, enemy: white };
+        }
+
+        // Helpers to determine attacks and king-safety
+        function isPathClear(fromR, fromC, toR, toC, allPieces) {
+            const dr = Math.sign(toR - fromR);
+            const dc = Math.sign(toC - fromC);
+            let r = fromR + dr, c = fromC + dc;
+            while (r !== toR || c !== toC) {
+                if (allPieces.some(p => p.row === r && p.col === c)) return false;
+                r += dr; c += dc;
+            }
+            return true;
+        }
+
+        function pieceAttacksSquare(piece, targetR, targetC, allOwn, allEnemy) {
+            const type = piece.type;
+            const pr = piece.row, pc = piece.col;
+            if (type === 'pawn') {
+                const dir = piece.color === Color.WHITE ? -1 : 1;
+                return (pr + dir === targetR) && (Math.abs(pc - targetC) === 1);
+            }
+            if (type === 'knight') {
+                const dr = Math.abs(pr - targetR); const dc = Math.abs(pc - targetC);
+                return (dr === 1 && dc === 2) || (dr === 2 && dc === 1);
+            }
+            if (type === 'king') {
+                return Math.max(Math.abs(pr - targetR), Math.abs(pc - targetC)) === 1;
+            }
+            // sliding pieces
+            if (type === 'rook' || type === 'bishop' || type === 'queen') {
+                const dr = targetR - pr; const dc = targetC - pc;
+                const adr = Math.abs(dr), adc = Math.abs(dc);
+                const all = allOwn.concat(allEnemy);
+                if (type === 'rook' && (dr === 0 || dc === 0)) {
+                    if (!isPathClear(pr, pc, targetR, targetC, all)) return false;
+                    return true;
+                }
+                if (type === 'bishop' && adr === adc) {
+                    if (!isPathClear(pr, pc, targetR, targetC, all)) return false;
+                    return true;
+                }
+                if (type === 'queen' && (adr === adc || dr === 0 || dc === 0)) {
+                    if (!isPathClear(pr, pc, targetR, targetC, all)) return false;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        function isSquareAttacked(r, c, byColor) {
+            const attackers = byColor === Color.WHITE ? white : black;
+            const own = byColor === Color.WHITE ? white : black;
+            const enemy = byColor === Color.WHITE ? black : white;
+            for (const p of attackers) {
+                if (pieceAttacksSquare(p, r, c, own, enemy)) return true;
+            }
+            return false;
+        }
+
+        function moveLeavesKingInCheck(piece, move) {
+            // simulate move and test whether own king is in check
+            const ownList = piece.color === Color.WHITE ? white : black;
+            const enemyList = piece.color === Color.WHITE ? black : white;
+
+            const origR = piece.row, origC = piece.col;
+            // remove captured piece if any
+            let removed = null; let removedIndex = -1; let removedList = null;
+
+            if (move.enpassant && lastMove) {
+                // en-passant captures the pawn that moved last
+                removedList = enemyList;
+                removedIndex = enemyList.findIndex(p => p.row === lastMove.toRow && p.col === lastMove.toCol);
+                if (removedIndex !== -1) removed = enemyList.splice(removedIndex, 1)[0];
+            } else {
+                removedList = enemyList;
+                removedIndex = enemyList.findIndex(p => p.row === move.row && p.col === move.col);
+                if (removedIndex !== -1) removed = enemyList.splice(removedIndex, 1)[0];
+            }
+
+            // apply move
+            piece.row = move.row; piece.col = move.col;
+
+            // find own king
+            const king = ownList.find(p => p.type === 'king');
+            const kingRow = king ? king.row : null;
+            const kingCol = king ? king.col : null;
+
+            const inCheck = kingRow !== null && isSquareAttacked(kingRow, kingCol, piece.color === Color.WHITE ? Color.BLACK : Color.WHITE);
+
+            // undo
+            piece.row = origR; piece.col = origC;
+            if (removed) removedList.splice(removedIndex, 0, removed);
+
+            return inCheck;
+        }
+
+        function initBoard() {
+            white = [];
+            black = [];
+            for (let i = 0; i < 8; i++) {
+                white.push(new Pawn(6, i, Color.WHITE));
+                black.push(new Pawn(1, i, Color.BLACK));
+            }
+            white.push(new Rook(7, 0, Color.WHITE)); white.push(new Rook(7, 7, Color.WHITE));
+            black.push(new Rook(0, 0, Color.BLACK)); black.push(new Rook(0, 7, Color.BLACK));
+            white.push(new Knight(7, 1, Color.WHITE)); white.push(new Knight(7, 6, Color.WHITE));
+            black.push(new Knight(0, 1, Color.BLACK)); black.push(new Knight(0, 6, Color.BLACK));
+            white.push(new Bishop(7, 2, Color.WHITE)); white.push(new Bishop(7, 5, Color.WHITE));
+            black.push(new Bishop(0, 2, Color.BLACK)); black.push(new Bishop(0, 5, Color.BLACK));
+            white.push(new Queen(7, 3, Color.WHITE)); white.push(new King(7, 4, Color.WHITE));
+            black.push(new Queen(0, 3, Color.BLACK)); black.push(new King(0, 4, Color.BLACK));
+        }
+
+        initBoard();
+
+        function clearCanvas() { ctx.fillStyle = WHITE; ctx.fillRect(0, 0, board.width, board.height); }
+
+        function drawBoard() {
+            // draw board squares using view-mapped positions so only layout flips; pieces/images remain upright
+            for (let r = 0; r < 8; r++) {
+                for (let c = 0; c < 8; c++) {
+                    const v = modelToView(r, c);
+                    ctx.fillStyle = (r + c) % 2 === 0 ? WHITE : BLACK;
+                    ctx.fillRect(v.col * CELL, v.row * CELL, CELL, CELL);
                 }
             }
 
-            function findPieceAt(list, row, col) {
-                return list.find(p => p.row === row && p.col === col) || null;
+            if (activePiece) {
+                const v = modelToView(activePiece.row, activePiece.col);
+                ctx.fillStyle = 'rgba(0,255,0,0.25)';
+                ctx.fillRect(v.col * CELL, v.row * CELL, CELL, CELL);
+                // draw non-capture dots under pieces
+                lastMoveOptions.filter(m => !m.capture).forEach(m => {
+                    const mv = modelToView(m.row, m.col);
+                    ctx.beginPath(); ctx.fillStyle = 'rgba(0,0,0,0.6)';
+                    ctx.arc(mv.col * CELL + CELL / 2, mv.row * CELL + CELL / 2, 8, 0, Math.PI * 2); ctx.fill();
+                });
             }
 
-            board.addEventListener('click', (e) => {
-                const rect = board.getBoundingClientRect();
-                const x = e.clientX - rect.left; const y = e.clientY - rect.top;
-                let col = Math.floor(x / CELL); let row = Math.floor(y / CELL);
+            white.forEach(p => p.draw());
+            black.forEach(p => p.draw());
 
-                // if local view is flipped for Black, map view coords to model coords
-                const viewCol = col, viewRow = row;
-                if (myColor === Color.BLACK) {
-                    col = 7 - viewCol; row = 7 - viewRow;
+            // draw capture rings after pieces so they appear around the target piece
+            if (activePiece) {
+                lastMoveOptions.filter(m => m.capture).forEach(m => {
+                    let ringRow = m.row, ringCol = m.col;
+                    if (m.enpassant && lastMove) {
+                        ringRow = lastMove.toRow;
+                        ringCol = lastMove.toCol;
+                    }
+                    const rv = modelToView(ringRow, ringCol);
+                    ctx.beginPath();
+                    ctx.lineWidth = 6;
+                    ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+                    ctx.arc(rv.col * CELL + CELL / 2, rv.row * CELL + CELL / 2, CELL * 0.45, 0, Math.PI * 2);
+                    ctx.stroke();
+                });
+                ctx.lineWidth = 1;
+            }
+
+            // game over overlay (unflipped)
+            if (gameOver) {
+                ctx.fillStyle = 'rgba(0,0,0,0.6)';
+                ctx.fillRect(0, 0, board.width, board.height);
+                ctx.fillStyle = 'white';
+                ctx.font = '24px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText(gameResult, board.width / 2, board.height / 2);
+            }
+        }
+
+        function flipPlayer() {
+            player = player === Color.WHITE ? Color.BLACK : Color.WHITE;
+            activePiece = null;
+            lastMoveOptions = [];
+            checkGameOver();
+            // start timer on first flip if not started
+            if (!timerStarted) startTimer();
+            updateTimerDisplays();
+            // publish timer state on turn flip so all clients sync
+            if (window.firebaseSetTimer && ROOM_ID) {
+                const state = { whiteBase: whiteTimeMs, blackBase: blackTimeMs, running: timerRunning, activeColor: player === Color.WHITE ? 'white' : 'black', lastUpdate: Date.now() };
+                window.firebaseSetTimer(ROOM_ID, state).catch(e => console.warn('setTimer failed', e));
+            }
+            // reload-until-white is now triggered on white moves only
+        }
+
+        function hasLegalMovesForColor(color) {
+            const lists = getListsForPlayer(color);
+            const own = lists.own;
+            const enemy = lists.enemy;
+            for (const p of own) {
+                const moves = p.moves(own, enemy) || [];
+                for (const m of moves) {
+                    if (!moveLeavesKingInCheck(p, m)) return true;
                 }
+            }
+            return false;
+        }
 
+        function checkGameOver() {
+            // if current player has no legal moves -> checkmate or stalemate
+            const hasMoves = hasLegalMovesForColor(player);
+            if (!hasMoves) {
+                // is king in check?
+                const lists = getListsForPlayer(player);
+                const king = lists.own.find(p => p.type === 'king');
+                const inCheck = king ? isSquareAttacked(king.row, king.col, player === Color.WHITE ? Color.BLACK : Color.WHITE) : false;
+                if (inCheck) {
+                    gameResult = (player === Color.WHITE ? 'Black wins by checkmate' : 'White wins by checkmate');
+                } else {
+                    gameResult = 'Draw by stalemate';
+                }
+                gameOver = true;
+            }
+        }
+
+        function findPieceAt(list, row, col) {
+            return list.find(p => p.row === row && p.col === col) || null;
+        }
+
+        board.addEventListener('click', (e) => {
+            const rect = board.getBoundingClientRect();
+            const x = e.clientX - rect.left; const y = e.clientY - rect.top;
+            let col = Math.floor(x / CELL); let row = Math.floor(y / CELL);
+
+            // if local view is flipped for Black, map view coords to model coords
+            const viewCol = col, viewRow = row;
+            if (myColor === Color.BLACK) {
+                col = 7 - viewCol; row = 7 - viewRow;
+            }
+
+                // ignore input when the game hasn't started yet
+                if (!timerStarted) return;
                 // ignore input when it's not this client's turn
                 if (player !== myColor) return;
 
-                const { own, enemy } = getListsForPlayer(player);
-                const clickedOwn = findPieceAt(own, row, col);
+            const { own, enemy } = getListsForPlayer(player);
+            const clickedOwn = findPieceAt(own, row, col);
 
-                if (!activePiece) {
-                    if (clickedOwn) { activePiece = clickedOwn; lastMoveOptions = activePiece.moves(own, enemy).filter(m => !moveLeavesKingInCheck(activePiece, m)); }
-                } else {
-                    const legal = lastMoveOptions;
-                    const matchedMove = legal.find(m => m.row === row && m.col === col);
-                    if (matchedMove) {
-                        const fromRow = activePiece.row, fromCol = activePiece.col;
+            if (!activePiece) {
+                if (clickedOwn) { activePiece = clickedOwn; lastMoveOptions = activePiece.moves(own, enemy).filter(m => !moveLeavesKingInCheck(activePiece, m)); }
+            } else {
+                const legal = lastMoveOptions;
+                const matchedMove = legal.find(m => m.row === row && m.col === col);
+                if (matchedMove) {
+                    const fromRow = activePiece.row, fromCol = activePiece.col;
 
-                        // compute captured square for sending (for en-passant the captured pawn was lastMove.toRow/Col)
-                        let capturedRow = row, capturedCol = col;
-                        if (matchedMove.enpassant && lastMove && lastMove.piece && lastMove.piece.type === 'pawn') {
-                            capturedRow = lastMove.toRow; capturedCol = lastMove.toCol;
-                        }
+                    // compute captured square for sending (for en-passant the captured pawn was lastMove.toRow/Col)
+                    let capturedRow = row, capturedCol = col;
+                    if (matchedMove.enpassant && lastMove && lastMove.piece && lastMove.piece.type === 'pawn') {
+                        capturedRow = lastMove.toRow; capturedCol = lastMove.toCol;
+                    }
 
-                        // send move to RTDB (if available) -- avoid sending when applying remote move
-                        if (!applyingRemoteMove && window.firebaseSendMove) {
-                            const ts = Date.now();
-                            const moveDoc = {
-                                fromRow, fromCol,
-                                toRow: row, toCol: col,
-                                enpassant: !!matchedMove.enpassant,
-                                capturedRow, capturedCol,
-                                color: activePiece.color,
-                                type: activePiece.type,
-                                ts
-                            };
-                            // mark as seen locally so the listener won't reapply our own write
-                            seenRemoteTimestamps.add(ts);
-                            window.firebaseSendMove(ROOM_ID, moveDoc).catch(err => console.warn('sendMove failed', err));
-                        }
+                    // send move to RTDB (if available) -- avoid sending when applying remote move
+                    if (!applyingRemoteMove && window.firebaseSendMove) {
+                        const ts = Date.now();
+                        const moveDoc = {
+                            fromRow, fromCol,
+                            toRow: row, toCol: col,
+                            enpassant: !!matchedMove.enpassant,
+                            capturedRow, capturedCol,
+                            color: activePiece.color,
+                            type: activePiece.type,
+                            ts
+                        };
+                        // mark as seen locally so the listener won't reapply our own write
+                        seenRemoteTimestamps.add(ts);
+                        try { lastSeenMoveTs = ts; } catch (e) {}
+                        window.firebaseSendMove(ROOM_ID, moveDoc).catch(err => console.warn('sendMove failed', err));
+                    }
 
-                        // handle en-passant capture (remove captured pawn)
-                        if (matchedMove.enpassant && lastMove && lastMove.piece && lastMove.piece.type === 'pawn') {
-                            const idx = (enemy).findIndex(p => p.row === lastMove.toRow && p.col === lastMove.toCol);
-                            if (idx !== -1) enemy.splice(idx, 1);
-                        } else {
-                            // normal capture (if any)
-                            const captureIndex = enemy.findIndex(p => p.row === row && p.col === col);
-                            if (captureIndex !== -1) enemy.splice(captureIndex, 1);
-                        }
-
-                        // apply move
-                        activePiece.row = row; activePiece.col = col;
-
-                        // record lastMove (for en-passant detection next turn)
-                        lastMove = { piece: activePiece, fromRow, fromCol, toRow: row, toCol: col };
-
-                        // flip player and clear selection
-                        flipPlayer();
+                    // handle en-passant capture (remove captured pawn)
+                    if (matchedMove.enpassant && lastMove && lastMove.piece && lastMove.piece.type === 'pawn') {
+                        const idx = (enemy).findIndex(p => p.row === lastMove.toRow && p.col === lastMove.toCol);
+                        if (idx !== -1) enemy.splice(idx, 1);
                     } else {
-                        if (clickedOwn) { activePiece = clickedOwn; lastMoveOptions = activePiece.moves(own, enemy).filter(m => !moveLeavesKingInCheck(activePiece, m)); }
-                        else { activePiece = null; lastMoveOptions = []; }
+                        // normal capture (if any)
+                        const captureIndex = enemy.findIndex(p => p.row === row && p.col === col);
+                        if (captureIndex !== -1) enemy.splice(captureIndex, 1);
                     }
-                }
-            });
 
-            // listen for remote moves in this room
-            if (window.firebaseListenMoves) {
-                window.firebaseListenMoves(ROOM_ID, (doc) => {
-                    if (!doc || !doc.ts) return;
-                    if (seenRemoteTimestamps.has(doc.ts)) return; // already applied locally
-                    applyingRemoteMove = true;
+                    // apply move
+                    activePiece.row = row; activePiece.col = col;
 
-                    const fromRow = doc.fromRow, fromCol = doc.fromCol, toRow = doc.toRow, toCol = doc.toCol;
-                    const moverList = doc.color === Color.WHITE ? white : black;
-                    const enemyList = doc.color === Color.WHITE ? black : white;
-
-                    const piece = findPieceAt(moverList, fromRow, fromCol) || moverList.find(p => p.type === doc.type && p.row === fromRow && p.col === fromCol);
-                    if (piece) {
-                        // remove captured piece
-                        if (doc.enpassant && doc.capturedRow !== undefined) {
-                            const idx = enemyList.findIndex(p => p.row === doc.capturedRow && p.col === doc.capturedCol);
-                            if (idx !== -1) enemyList.splice(idx, 1);
-                        } else {
-                            const capIdx = enemyList.findIndex(p => p.row === toRow && p.col === toCol);
-                            if (capIdx !== -1) enemyList.splice(capIdx, 1);
+                    // record lastMove (for en-passant detection next turn)
+                    lastMove = { piece: activePiece, fromRow, fromCol, toRow: row, toCol: col };
+                    // if this client made a white move, snapshot the board AFTER applying it and start reload-until-change
+                    try {
+                        if (activePiece.color === Color.WHITE && myColor === Color.WHITE) {
+                            try { lastWhiteSig = computeFullSig(); lastWhiteMoveTs = Date.now(); sessionStorage.setItem('lastWhiteSig', lastWhiteSig); sessionStorage.setItem('lastWhiteMoveTs', String(lastWhiteMoveTs)); } catch (e) {}
+                            startReloadUntilWhite();
                         }
+                    } catch (e) {}
+                    // flip player and clear selection
+                    flipPlayer();
+                } else {
+                    if (clickedOwn) { activePiece = clickedOwn; lastMoveOptions = activePiece.moves(own, enemy).filter(m => !moveLeavesKingInCheck(activePiece, m)); }
+                    else { activePiece = null; lastMoveOptions = []; }
+                }
+            }
+        });
 
-                        piece.row = toRow; piece.col = toCol;
-                        lastMove = { piece: piece, fromRow: fromRow, fromCol: fromCol, toRow: toRow, toCol: toCol };
-                        seenRemoteTimestamps.add(doc.ts);
-                        // Don't call flipPlayer() on remote-applying side (avoids double-toggle/race with timer updates).
-                        // Instead, set the current player to the opposite of the mover's color so UI immediately matches.
-                        player = (doc.color === Color.WHITE) ? Color.BLACK : Color.WHITE;
-                        activePiece = null; lastMoveOptions = [];
-                        // keep displays in sync until timer state arrives
-                        try { updateTimerDisplays(); } catch (e) { }
+        // listen for remote moves in this room
+        if (window.firebaseListenMoves) {
+                    window.firebaseListenMoves(ROOM_ID, (doc) => { 
+                try { console.debug && console.debug('remote move received', doc); } catch (e) {}
+                        try { window.__diag && window.__diag.log && window.__diag.log('remote move received: ' + (typeof doc === 'object' ? JSON.stringify(doc).slice(0,200) : String(doc))); } catch (e) {}
+                if (!doc || !doc.ts) return;
+                        if (seenRemoteTimestamps.has(doc.ts)) return; // already applied locally
+                applyingRemoteMove = true;
+
+                const fromRow = doc.fromRow, fromCol = doc.fromCol, toRow = doc.toRow, toCol = doc.toCol;
+                const moverList = doc.color === Color.WHITE ? white : black;
+                const enemyList = doc.color === Color.WHITE ? black : white;
+
+                const piece = findPieceAt(moverList, fromRow, fromCol) || moverList.find(p => p.type === doc.type && p.row === fromRow && p.col === fromCol);
+                if (piece) {
+                    // remove captured piece
+                    if (doc.enpassant && doc.capturedRow !== undefined) {
+                        const idx = enemyList.findIndex(p => p.row === doc.capturedRow && p.col === doc.capturedCol);
+                        if (idx !== -1) enemyList.splice(idx, 1);
+                    } else {
+                        const capIdx = enemyList.findIndex(p => p.row === toRow && p.col === toCol);
+                        if (capIdx !== -1) enemyList.splice(capIdx, 1);
                     }
 
-                    applyingRemoteMove = false;
-                });
-            }
+                    piece.row = toRow; piece.col = toCol;
+                    lastMove = { piece: piece, fromRow: fromRow, fromCol: fromCol, toRow: toRow, toCol: toCol };
+                    seenRemoteTimestamps.add(doc.ts);
+                    try { lastSeenMoveTs = doc.ts; } catch (e) {}
+                    try {
+                        if (doc.color === Color.WHITE) {
+                            lastWhiteSig = computeFullSig();
+                            lastWhiteMoveTs = doc.ts || Date.now();
+                            try { sessionStorage.setItem('lastWhiteSig', lastWhiteSig); sessionStorage.setItem('lastWhiteMoveTs', String(lastWhiteMoveTs)); } catch (e) {}
+                            if (myColor === Color.WHITE) startReloadUntilWhite();
+                        } else if (doc.color === Color.BLACK) {
+                            if (lastWhiteMoveTs && doc.ts && doc.ts > lastWhiteMoveTs) stopReloadUntilWhite();
+                        }
+                    } catch (e) {}
+                    // Don't call flipPlayer() on remote-applying side (avoids double-toggle/race with timer updates).
+                    // Instead, set the current player to the opposite of the mover's color so UI immediately matches.
+                    player = (doc.color === Color.WHITE) ? Color.BLACK : Color.WHITE;
+                    activePiece = null; lastMoveOptions = [];
+                    // keep displays in sync until timer state arrives
+                    try { updateTimerDisplays(); } catch (e) { }
+                }
 
-            // listen for timer state changes
-            if (window.firebaseListenTimer) {
-                window.firebaseListenTimer(ROOM_ID, (s) => { try { applyTimerState(s); } catch (e) { console.warn('timer apply error', e); } });
-            }
+                applyingRemoteMove = false;
+            });
+        }
 
-            function gameLoop() { clearCanvas(); drawBoard(); requestAnimationFrame(gameLoop); }
-            requestAnimationFrame(gameLoop);
+        // listen for timer state changes
+        if (window.firebaseListenTimer) {
+            window.firebaseListenTimer(ROOM_ID, (s) => { try { applyTimerState(s); } catch (e) { console.warn('timer apply error', e); } });
+        }
+
+        function gameLoop() {
+            try {
+                // per-frame check: detect black-piece changes (useful after listeners apply remote moves)
+                const sig = computeBlackSig();
+                if (sig !== lastBlackSig) {
+                    lastBlackSig = sig;
+                    try { window.__diag && window.__diag.log && window.__diag.log('black pieces changed: ' + sig + ' lastSeenMoveTs=' + lastSeenMoveTs); } catch (e) {}
+                }
+            } catch (e) { /* ignore diagnostics errors */ }
+            clearCanvas(); drawBoard(); requestAnimationFrame(gameLoop);
+        }
+        requestAnimationFrame(gameLoop);
         });
     </script>
 </body>
