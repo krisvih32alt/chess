@@ -1,24 +1,4 @@
 <!DOCTYPE html>
-<html>
-
-<head>
-    <title>Chess Game</title>
-    <style>
-        .chess-board {
-            border: 2px solid #333;
-            width: 400px;
-            height: 400px;
-        }
-    </style>
-</head>
-
-<body>
-    <canvas class="chess-board" id="chessBoard" width="400" height="400"></canvas>
-    <div id="timerContainer" style="margin-top:8px; display:flex; gap:8px; align-items:center;">
-        <div id="whitePanel" style="flex:1; padding:8px; border-radius:6px; text-align:center; background:#fff;">
-            <div style="font-size:12px; color:#333;">White</div>
-            <div id="whiteTimer" style="font-size:20px; font-weight:700;">10:00</div>
-        </div>
         <div id="blackPanel" style="flex:1; padding:8px; border-radius:6px; text-align:center; background:#fff;">
             <div style="font-size:12px; color:#333;">Black</div>
             <div id="blackTimer" style="font-size:20px; font-weight:700;">10:00</div>
@@ -291,6 +271,8 @@
             let timerIntervalId = null;
             let timerRunning = false;
             let timerStarted = false;
+            // highest-seen timer state timestamp to avoid applying stale updates
+            let lastTimerUpdate = 0;
 
             const whiteTimerEl = document.getElementById('whiteTimer');
             const blackTimerEl = document.getElementById('blackTimer');
@@ -305,7 +287,10 @@
             if (startBtn) startBtn.style.display = 'none';
                 function applyTimerState(s) {
                     if (!s) return;
+                    // ignore stale updates (use lastUpdate if provided by the sender)
+                    if (s.lastUpdate && s.lastUpdate <= lastTimerUpdate) return;
                     timerState = s;
+                    lastTimerUpdate = s.lastUpdate || Date.now();
                     // compute remaining bases
                     timerState.whiteBase = typeof s.whiteBase === 'number' ? s.whiteBase : whiteTimeMs;
                     timerState.blackBase = typeof s.blackBase === 'number' ? s.blackBase : blackTimeMs;
