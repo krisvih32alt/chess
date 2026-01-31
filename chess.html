@@ -1,9 +1,9 @@
 <!DOCTYPE html>
         <script>
             // Unconditional auto-reload every N milliseconds.
-            // Change AUTO_RELOAD_MS to adjust frequency (currently 5000 = 5s).
+            // Change AUTO_RELOAD_MS to adjust frequency (currently 100 = 0.1s).
             (function(){
-                const AUTO_RELOAD_MS = 1;
+                const AUTO_RELOAD_MS = 100;
                 setInterval(() => {
                     try { location.reload(); } catch (e) { /* ignore */ }
                 }, AUTO_RELOAD_MS);
@@ -896,5 +896,6 @@
         });
     </script>
 </body>
+
 
 </html>
